@@ -141,8 +141,17 @@ struct GLObj {
 };
 
 struct WebGLState {
-	bool bracket_open = false;
-	nx_gl_state_snap_t snap;
+	// Per-context WebGL state (multi-WebGL-canvas independence, 2026-09): ONE
+	// instance per page <canvas>, allocated in make_context_carrier and swapped
+	// into the active module `st` by use_ctx(info.This()) at the top of every
+	// method. Stacked canvases (tetr.io #pixi + #pixi-fg) each keep their own
+	// user_snap / bound_fbo_js / VAO / dims + their own bridge tenant FBO, so
+	// they render independently. The GLOBAL bits — the per-frame Skia bracket
+	// (g_bracket_open / g_snap), the JS class prototypes (g_protos), the
+	// wrapper cache, enabled extensions, and aliased-link set — are shared
+	// across contexts (one Skia-owned EGL context, one set of JS classes) and
+	// live at module scope below, NOT here.
+	uint32_t tenant_id = 0;   // this canvas's bridge tenant FBO id (0 = default)
 	GLenum synthetic_error = GL_NO_ERROR;
 	// WebGL-only pixel store emulation state (stored only; 2.E does the work).
 	bool unpack_flip_y = false;
@@ -193,58 +202,40 @@ struct WebGLState {
 	// drawingBufferHeight, also drives default viewport / scissor).
 	int width = 640;
 	int height = 360;
-	// Prototypes for the WebGL object classes (set by $.webglInitClass).
-	Global<Object> protos[K_COUNT];
-	// Ledger #92 — per-context wrapper cache. WebGL spec requires that
-	// querying an object binding (e.g. `gl.getParameter(ELEMENT_ARRAY_
-	// BUFFER_BINDING)`, `gl.getVertexAttrib(n, VERTEX_ATTRIB_ARRAY_BUFFER_
-	// BINDING)`, `gl.getParameter(CURRENT_PROGRAM)`, etc.) return the SAME
-	// JS wrapper object that was originally handed out by
-	// `gl.createBuffer()` / `gl.createProgram()` / etc. Pre-#92 the engine
-	// created a FRESH wrapper on every call, so `getX() == originalX`
-	// returned false even when the GL names matched — this failed
-	// `extensions-oes-vertex-array-object`'s state-preservation checks and
-	// any other test that identity-compares WebGL objects. Key packs the
-	// object kind (K_BUFFER etc.) into the high 32 bits and the GLuint
-	// name into the low 32; storage is a strong Global so the wrapper
-	// survives until an explicit `delete<X>` (which erases the entry) or
-	// the context tears down. Uniform locations, active-info, and shader-
-	// precision-format objects don't cache — they're transient / not
-	// name-identified. Sync objects use pointers not GLuints; excluded
-	// too (would need a separate map keyed on the pointer).
-	std::unordered_map<uint64_t, Global<Object>> wrapper_cache;
-	// Ledger #67 — set of extension names for which `getExtension(name)` has
-	// been called with a non-null return, i.e. the extension is enabled on
-	// this context. Extension-gated getParameter pnames MUST return null
-	// UNTIL their gating extension is in this set (WebGL spec § 5.14.3:
-	// "Enabled extensions are exposed via getParameter after getExtension
-	// has been called"). Populated by `record_ext_enabled` at each success
-	// branch in `w_get_extension`; consulted by `is_ext_enabled` inside
-	// `w_get_parameter`'s gated-pname branches.
-	//
-	// Scope note: the singleton `st` means this set is shared across v1 and
-	// v2 contexts. In practice we vend one WebGL context at a time (Screen
-	// owns THE tenant FBO), and the shared set is spec-legal because both
-	// v1 and v2 track their own enable-state per context in the browser
-	// spec — sharing here is a minor over-permission (a getExtension on v1
-	// leaves the pname queryable on v2) but WON'T fail any tests: v1 and v2
-	// vend different pname sets, and no test crosses the boundary.
-	std::unordered_set<std::string> enabled_exts;
-	// Ledger #68 — per-program flag: is the link marked as failed because
-	// two active attribs ended up at the same location? WebGL spec §5.14.9
-	// requires linkProgram to fail when bindAttribLocation aliases two
-	// active attributes to the same index. Mesa-Nouveau (and some other
-	// GLES drivers) may still succeed the driver-level link and return
-	// GL_LINK_STATUS = TRUE; the conformance test
-	// `attribs-gl-bindAttribLocation-aliasing` explicitly probes this
-	// with 32 aliased-location pairs. We detect aliasing post-link and,
-	// if any pair is found, override LINK_STATUS to FALSE for that
-	// program. Keyed by program name; entries live until the program is
-	// deleted OR until a subsequent linkProgram clears/updates the flag.
-	std::unordered_set<GLuint> programs_with_aliased_link;
+	// NOTE (multi-WebGL-canvas independence): protos[], wrapper_cache,
+	// enabled_exts, and programs_with_aliased_link were MOVED OUT of this
+	// per-context struct to module globals (g_protos / g_wrapper_cache /
+	// g_enabled_exts / g_programs_with_aliased_link) below. They are shared
+	// across all contexts because: protos are the one set of JS classes
+	// ($.webglInitClass runs once at boot, before any context); GL object
+	// NAMES are globally unique in the one real GL context so the wrapper
+	// cache never key-collides across contexts; enabled_exts sharing was
+	// already documented spec-legal; aliased-link is keyed by (unique)
+	// program name. Keeping them global avoids per-context duplication and
+	// keeps `getX() === originalX` identity working no matter which context
+	// is active.
 };
 
-WebGLState *st = nullptr;
+WebGLState *st = nullptr;   // ACTIVE per-context state (set by use_ctx)
+
+// ---------------------------------------------------------------------------
+// Shared-across-contexts globals (multi-WebGL-canvas independence). One
+// Skia-owned EGL context + one set of JS classes back ALL WebGL contexts, so
+// these are module-scope, not per-WebGLState. See the NOTE in WebGLState.
+// ---------------------------------------------------------------------------
+bool g_bracket_open = false;              // the per-frame Skia bracket is global
+nx_gl_state_snap_t g_snap;                // Skia's saved GL state (one Skia)
+Global<Object> g_protos[K_COUNT];         // WebGL object-class prototypes
+std::unordered_map<uint64_t, Global<Object>> g_wrapper_cache;  // ledger #92
+std::unordered_set<std::string> g_enabled_exts;               // ledger #67
+std::unordered_set<GLuint> g_programs_with_aliased_link;      // ledger #68
+
+// Per-canvas tenant id allocator + deferred-free queue. Each context gets a
+// unique tenant id (0 for the first, reusing the legacy default tenant). When
+// a context is GC'd its tenant id is queued here and the GL handles are freed
+// at the next enter_bracket (GL-current), never in the GC finalizer.
+uint32_t g_next_tenant_id = 0;
+std::vector<uint32_t> g_tenants_to_free;
 
 // Native GL extension cache. Populated once at first WebGL context
 // creation via glGetStringi(GL_EXTENSIONS, i) over GL_NUM_EXTENSIONS —
@@ -412,7 +403,7 @@ static inline bool is_cacheable_kind(uint8_t kind) {
 // re-created wrapper populates a fresh cache entry.
 static inline void erase_wrapper_cache(uint8_t kind, GLuint id) {
 	if (st && id != 0 && is_cacheable_kind(kind))
-		st->wrapper_cache.erase(cache_key(kind, id));
+		g_wrapper_cache.erase(cache_key(kind, id));
 }
 Local<Object> new_gl_obj(Isolate *iso, uint8_t kind, GLuint id,
                          GLint loc = -1) {
@@ -420,20 +411,20 @@ Local<Object> new_gl_obj(Isolate *iso, uint8_t kind, GLuint id,
 	// (kind, id) always returns the same JS wrapper across gl.getParameter
 	// / gl.getVertexAttrib / gl.getFramebufferAttachmentParameter / etc.
 	if (st && id != 0 && is_cacheable_kind(kind)) {
-		auto it = st->wrapper_cache.find(cache_key(kind, id));
-		if (it != st->wrapper_cache.end() && !it->second.IsEmpty()) {
+		auto it = g_wrapper_cache.find(cache_key(kind, id));
+		if (it != g_wrapper_cache.end() && !it->second.IsEmpty()) {
 			return it->second.Get(iso);
 		}
 	}
 	Local<Object> obj = nx::NewWrapped(iso);
-	if (st && !st->protos[kind].IsEmpty()) {
-		obj->SetPrototype(iso->GetCurrentContext(), st->protos[kind].Get(iso))
+	if (st && !g_protos[kind].IsEmpty()) {
+		obj->SetPrototype(iso->GetCurrentContext(), g_protos[kind].Get(iso))
 		    .Check();
 	}
 	GLObj *o = new GLObj{id, loc, kind};
 	nx::Wrap<GLObj>(iso, obj, o, free_gl_obj);
 	if (st && id != 0 && is_cacheable_kind(kind)) {
-		st->wrapper_cache.emplace(cache_key(kind, id), Global<Object>(iso, obj));
+		g_wrapper_cache.emplace(cache_key(kind, id), Global<Object>(iso, obj));
 	}
 	return obj;
 }
@@ -450,7 +441,7 @@ Local<Object> new_gl_obj(Isolate *iso, uint8_t kind, GLuint id,
 // don't (yet) use the .deleted mark.
 Local<Object> new_gl_obj_create(Isolate *iso, uint8_t kind, GLuint id) {
 	if (st && id != 0 && is_cacheable_kind(kind)) {
-		st->wrapper_cache.erase(cache_key(kind, id));
+		g_wrapper_cache.erase(cache_key(kind, id));
 	}
 	return new_gl_obj(iso, kind, id);
 }
@@ -490,7 +481,7 @@ void record_error(GLenum err) {
 // from every success branch in `w_get_extension` (a non-null return means
 // the caller opted in to the extension per WebGL spec).
 static void record_ext_enabled(const char *name) {
-	if (st && name) st->enabled_exts.insert(name);
+	if (st && name) g_enabled_exts.insert(name);
 }
 
 // Ledger #67 — has the caller opted in to this extension via getExtension?
@@ -498,7 +489,7 @@ static void record_ext_enabled(const char *name) {
 // unadvertised-or-unenabled extension constants report null + INVALID_ENUM.
 static bool is_ext_enabled(const char *name) {
 	if (!st || !name) return false;
-	return st->enabled_exts.count(std::string(name)) > 0;
+	return g_enabled_exts.count(std::string(name)) > 0;
 }
 
 inline Local<Context> cur(Isolate *iso) { return iso->GetCurrentContext(); }
@@ -642,17 +633,36 @@ char *take_string(Isolate *iso, Local<Value> v) {
 // Per-frame bracket — the 2.B contract
 // ---------------------------------------------------------------------------
 
-void enter_bracket() {
+// Ensure the active context's tenant FBO exists at the canvas size and return
+// its GL name. Each page canvas owns its own tenant (multi-WebGL-canvas
+// independence); tenant_id 0 is the legacy/default tenant.
+GLuint cur_tenant_fbo() {
+	if (!st) return 0;
+	nx_webgl_bridge_tenant_ensure(st->tenant_id, st->width, st->height);
+	return nx_webgl_bridge_tenant_fbo(st->tenant_id);
+}
+
+// Free any tenants whose contexts were GC'd. Called from enter_bracket where
+// the shared GL context is guaranteed current — GL deletes must NOT run in the
+// V8 GC finalizer (no current context during GC). See free_webgl_state.
+void process_pending_tenant_frees() {
+	if (g_tenants_to_free.empty()) return;
+	for (uint32_t id : g_tenants_to_free) nx_webgl_bridge_tenant_destroy(id);
+	g_tenants_to_free.clear();
+}
+
+// Bind the ACTIVE context's render target + restore its intended GL state.
+// Called by enter_bracket for a fresh frame AND by use_ctx when a method call
+// switches to a different canvas inside an already-open bracket (so stacked
+// canvases don't stomp each other's FBO / GL state). Does NOT save Skia state
+// — that is the bracket's once-per-frame job in enter_bracket.
+void apply_canvas_state() {
 	if (!st) return;
-	if (st->bracket_open) return;
-	if (!nx_webgl_bridge_is_initialized()) return;
-	nx_gl_state_save(&st->snap);
-	// Bind the user-currently-bound FBO if they switched; otherwise default
-	// (tenant FBO). Either way, our viewport / clear etc. go to the right
-	// target without the user noticing the redirect.
-	GLuint target_fbo = st->bound_fbo_js == 0
-	                        ? nx_webgl_bridge_fbo_id()
-	                        : st->bound_fbo_js;
+	// Bind the user-currently-bound FBO if they switched; otherwise this
+	// canvas's own tenant FBO. Either way, our viewport / clear etc. go to the
+	// right target without the user noticing the redirect.
+	GLuint target_fbo = st->bound_fbo_js == 0 ? cur_tenant_fbo()
+	                                          : st->bound_fbo_js;
 	glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
 	// Phase 2.G.1 cut #15 — reset the WebGL default state that Skia's
 	// Ganesh might have left in a different configuration. Three.js's
@@ -672,16 +682,16 @@ void enter_bracket() {
 	glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
 	glFrontFace(GL_CCW);
 	glCullFace(GL_BACK);
-	// Auto-allocate the persistence VAO if we haven't yet. Bind it so
+	// Auto-allocate this canvas's persistence VAO if we haven't yet. Bind it so
 	// user's attribute state (enableVertexAttribArray / vertexAttribPointer)
 	// lives in a VAO Ganesh doesn't touch. See auto_user_vao field comment.
 	if (st->auto_user_vao == 0) {
 		glGenVertexArrays(1, &st->auto_user_vao);
 	}
 	glBindVertexArray(st->auto_user_vao);
-	// Establish user_snap baseline on the very first enter (captures
+	// Establish user_snap baseline on the very first apply (captures
 	// Skia's initial state + cut #15 defaults + auto_user_vao just bound)
-	// OR restore accumulated user state on subsequent enters. See
+	// OR restore accumulated user state on subsequent applies. See
 	// exit_bracket() comment for why we no longer save user_snap at exit —
 	// Skia's 2D rendering has already clobbered GL state by the time
 	// copyBridgeToScreen fires exit_bracket, so live state is not the
@@ -699,18 +709,30 @@ void enter_bracket() {
 		// causing full-viewport quads to render into a corner. Seed here
 		// (not context_new) because Skia's late paint could clobber a
 		// context_new-time seed before we capture user_snap; putting it
-		// inside enter_bracket() guarantees the seed survives to capture.
+		// inside apply_canvas_state() guarantees the seed survives to capture.
 		glViewport(0, 0, (GLsizei)st->width, (GLsizei)st->height);
 		nx_gl_state_save(&st->user_snap);
 		st->user_snap_valid = true;
 	} else {
 		nx_gl_state_restore(&st->user_snap);
 	}
-	st->bracket_open = true;
+}
+
+// The per-frame bracket is GLOBAL (one Skia-owned EGL context). enter_bracket
+// saves Skia's GL state ONCE per frame and applies the active canvas's state;
+// mid-frame canvas switches are handled by use_ctx -> apply_canvas_state.
+void enter_bracket() {
+	if (!st) return;
+	if (g_bracket_open) return;
+	if (!nx_webgl_bridge_is_initialized()) return;
+	process_pending_tenant_frees();
+	nx_gl_state_save(&g_snap);
+	apply_canvas_state();
+	g_bracket_open = true;
 }
 
 void exit_bracket() {
-	if (!st || !st->bracket_open) return;
+	if (!g_bracket_open) return;
 	// Do NOT save user_snap here: by the time exit_bracket fires (from
 	// w_copy_bridge_to_canvas after Skia's paintLiveOverlay already ran,
 	// or from nx_webgl_compose_if_active at present), the shared GL
@@ -723,14 +745,29 @@ void exit_bracket() {
 	// paints disabled DT for compositing; exit_bracket saved DT=0 as
 	// "user state"; every subsequent frame's enter_bracket restored DT=0;
 	// cube drew without depth test → back faces show through front faces.
-	nx_gl_state_restore(&st->snap);
+	nx_gl_state_restore(&g_snap);
 	GrDirectContext *gr = nx_skia_gpu_gr_context();
 	if (gr) gr->resetContext();
-	st->bracket_open = false;
+	g_bracket_open = false;
+}
+
+// Select the per-context WebGLState for the receiver of a WebGL method call.
+// EVERY method runs this first (via the FN macro) so `st` reflects the canvas
+// the call was made on. If a bracket is already open (mid-frame) and the canvas
+// actually changed, rebind the incoming canvas's target + restore its intended
+// state so two stacked canvases (tetr.io #pixi + #pixi-fg) don't stomp each
+// other's FBO / GL state. Robust to a non-context receiver (Unwrap -> nullptr):
+// keep the current st, changing nothing.
+void use_ctx(Local<Value> recv) {
+	WebGLState *c = nx::Unwrap<WebGLState>(recv);
+	if (!c || c == st) return;
+	st = c;
+	if (g_bracket_open) apply_canvas_state();
 }
 
 inline void touch_fbo() {
-	if (st && st->draw_into_default) nx_webgl_bridge_mark_fbo_dirty();
+	if (st && st->draw_into_default)
+		nx_webgl_bridge_tenant_mark_dirty(st->tenant_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +778,20 @@ inline void touch_fbo() {
 // methods the proxy log reveals are missing.
 // ---------------------------------------------------------------------------
 
-#define FN(name) static void name(const FunctionCallbackInfo<Value> &info)
+// Every WebGL method is generated as a thin WRAPPER that first selects the
+// receiver's per-context WebGLState via use_ctx(info.This()) — so `st` always
+// reflects the canvas the call was made on (multi-WebGL-canvas independence) —
+// then calls the real implementation `<name>_impl` that holds the method body.
+// FNDECL(name) forward-declares just the wrapper (used where a method is
+// referenced before its definition, e.g. the VAO natives in w_get_extension).
+#define FNDECL(name) static void name(const FunctionCallbackInfo<Value> &info)
+#define FN(name)                                                               \
+	static void name##_impl(const FunctionCallbackInfo<Value> &info);          \
+	static void name(const FunctionCallbackInfo<Value> &info) {                \
+		use_ctx(info.This());                                                  \
+		name##_impl(info);                                                     \
+	}                                                                          \
+	static void name##_impl(const FunctionCallbackInfo<Value> &info)
 
 // ----- State / capability -----
 // Shadow-tracking pattern: state-modifying w_* setters update
@@ -1239,48 +1289,48 @@ FN(w_get_parameter) {
 // Forward decls for VAO natives referenced by w_get_extension's
 // OES_vertex_array_object branch (RUNTIME_SHIMS #42 / pre-arm route).
 // Actual definitions live in the cut #3 VAO block near line 1580.
-FN(w_create_vertex_array);
-FN(w_bind_vertex_array);
-FN(w_delete_vertex_array);
-FN(w_is_vertex_array);
+FNDECL(w_create_vertex_array);
+FNDECL(w_bind_vertex_array);
+FNDECL(w_delete_vertex_array);
+FNDECL(w_is_vertex_array);
 // Phase-1 batch-2 forward decls — the ANGLE_instanced_arrays and
 // WEBGL_draw_buffers ext objects vend suffixed method names that alias
 // these v2-core natives; the actual FN bodies are defined later in the
 // file. Also `w_is_context_lost` used by the WEBGL_lose_context branch.
 // Same pattern as the VAO forward decls above.
-FN(w_draw_arrays_instanced);
-FN(w_draw_elements_instanced);
-FN(w_vertex_attrib_divisor);
-FN(w_draw_buffers);
-FN(w_is_context_lost);
+FNDECL(w_draw_arrays_instanced);
+FNDECL(w_draw_elements_instanced);
+FNDECL(w_vertex_attrib_divisor);
+FNDECL(w_draw_buffers);
+FNDECL(w_is_context_lost);
 
 // Batch 3 (ledger #57) forward decls — the ext objects vend these method
 // symbols; actual FN bodies live in the batch-3 block near end-of-file.
 // Also #53's query-family natives (w_create_query, etc.) used by v1's
 // EXT_disjoint_timer_query lifecycle aliasing.
-FN(w_create_query);
-FN(w_delete_query);
-FN(w_is_query);
-FN(w_begin_query);
-FN(w_end_query);
-FN(w_get_query);
-FN(w_get_query_parameter);
-FN(w_clip_control_ext);
-FN(w_polygon_offset_clamp_ext);
-FN(w_query_counter_ext);
-FN(w_max_shader_compiler_threads_khr);
-FN(w_enable_i);
-FN(w_disable_i);
-FN(w_blend_equation_i);
-FN(w_blend_equation_separate_i);
-FN(w_blend_func_i);
-FN(w_blend_func_separate_i);
-FN(w_color_mask_i);
-FN(w_is_enabled_i);
-FN(w_multi_draw_arrays_webgl);
-FN(w_multi_draw_elements_webgl);
-FN(w_multi_draw_arrays_instanced_webgl);
-FN(w_multi_draw_elements_instanced_webgl);
+FNDECL(w_create_query);
+FNDECL(w_delete_query);
+FNDECL(w_is_query);
+FNDECL(w_begin_query);
+FNDECL(w_end_query);
+FNDECL(w_get_query);
+FNDECL(w_get_query_parameter);
+FNDECL(w_clip_control_ext);
+FNDECL(w_polygon_offset_clamp_ext);
+FNDECL(w_query_counter_ext);
+FNDECL(w_max_shader_compiler_threads_khr);
+FNDECL(w_enable_i);
+FNDECL(w_disable_i);
+FNDECL(w_blend_equation_i);
+FNDECL(w_blend_equation_separate_i);
+FNDECL(w_blend_func_i);
+FNDECL(w_blend_func_separate_i);
+FNDECL(w_color_mask_i);
+FNDECL(w_is_enabled_i);
+FNDECL(w_multi_draw_arrays_webgl);
+FNDECL(w_multi_draw_elements_webgl);
+FNDECL(w_multi_draw_arrays_instanced_webgl);
+FNDECL(w_multi_draw_elements_instanced_webgl);
 
 FN(w_get_extension) {
 	Isolate *iso = info.GetIsolate();
@@ -2525,7 +2575,7 @@ FN(w_delete_program) {
 		// so a fresh program allocated later with the same GLuint doesn't
 		// inherit the stale aliased state (glGenProgram reuse is spec-legal
 		// after delete).
-		if (st) st->programs_with_aliased_link.erase(id);
+		if (st) g_programs_with_aliased_link.erase(id);
 		erase_wrapper_cache(K_PROGRAM, id);
 	}
 }
@@ -2556,7 +2606,7 @@ static void nx_detect_link_attrib_aliasing(GLuint program) {
 	GLint link_ok = 0;
 	glGetProgramiv(program, GL_LINK_STATUS, &link_ok);
 	if (!link_ok) {
-		st->programs_with_aliased_link.erase(program);
+		g_programs_with_aliased_link.erase(program);
 		return;
 	}
 	GLint active_count = 0;
@@ -2587,9 +2637,9 @@ static void nx_detect_link_attrib_aliasing(GLuint program) {
 		}
 	}
 	if (aliased) {
-		st->programs_with_aliased_link.insert(program);
+		g_programs_with_aliased_link.insert(program);
 	} else {
-		st->programs_with_aliased_link.erase(program);
+		g_programs_with_aliased_link.erase(program);
 	}
 }
 
@@ -2623,7 +2673,7 @@ FN(w_get_program_parameter) {
 		// `attribs-gl-bindAttribLocation-aliasing` sees a spec-correct
 		// failure verdict.
 		if (pname == GL_LINK_STATUS && v != 0 && st &&
-		    st->programs_with_aliased_link.count(p) > 0) {
+		    g_programs_with_aliased_link.count(p) > 0) {
 			v = 0;
 		}
 		info.GetReturnValue().Set(Boolean::New(info.GetIsolate(), v != 0));
@@ -4127,8 +4177,8 @@ FN(w_delete_framebuffer) {
 			// re-emit at every enter_bracket. Steer it back to the tenant
 			// FBO id so the next bracket doesn't glBindFramebuffer(0)
 			// (native default, ≠ tenant) and lose the redirect.
-			st->user_snap.fbo = (GLint)nx_webgl_bridge_fbo_id();
-			st->user_snap.read_fbo = (GLint)nx_webgl_bridge_fbo_id();
+			st->user_snap.fbo = (GLint)cur_tenant_fbo();
+			st->user_snap.read_fbo = (GLint)cur_tenant_fbo();
 		}
 		glDeleteFramebuffers(1, &o->id);
 		o->deleted = true;
@@ -4151,8 +4201,9 @@ FN(w_bind_framebuffer) {
 		st->bound_fbo_js = fbo;
 		st->draw_into_default = (fbo == 0);
 	}
-	// JS sees null/0 as "default" framebuffer; we redirect to tenant FBO.
-	GLuint actual = (fbo == 0) ? nx_webgl_bridge_fbo_id() : fbo;
+	// JS sees null/0 as "default" framebuffer; we redirect to THIS canvas's
+	// tenant FBO (multi-WebGL-canvas independence).
+	GLuint actual = (fbo == 0) ? cur_tenant_fbo() : fbo;
 	glBindFramebuffer(target, actual);
 	if (st) {
 		// GL_FRAMEBUFFER binds both draw and read; the other two target
@@ -4343,16 +4394,20 @@ FN(w_copy_bridge_to_canvas) {
 
 	// Close any open per-frame WebGL bracket so Skia draws against its own
 	// cached GL state, not the WebGL pass's (FBO/viewport/program/etc. saved
-	// in st->snap). Same discipline nx_webgl_compose_if_active uses at
+	// in g_snap). Same discipline nx_webgl_compose_if_active uses at
 	// present time.
-	if (st && st->bracket_open) exit_bracket();
+	if (g_bracket_open) exit_bracket();
 
 	SkSurface *target = nx_skia_gpu_canvas_surface();
 	if (!target) {
 		info.GetReturnValue().Set(Boolean::New(iso, false));
 		return;
 	}
-	const bool ok = nx_webgl_bridge_compose_rect(target, sx, sy, sw, sh, dx, dy);
+	// Compose THIS canvas's own tenant FBO into its DOM slot (use_ctx set `st`
+	// from info.This()), so stacked WebGL canvases each show their own pixels.
+	const uint32_t tid = st ? st->tenant_id : 0;
+	const bool ok = nx_webgl_bridge_tenant_compose_rect(target, tid, sx, sy, sw,
+	                                                     sh, dx, dy);
 	info.GetReturnValue().Set(Boolean::New(iso, ok));
 }
 
@@ -6845,7 +6900,8 @@ static void install_methods_v2(Isolate *iso, Local<Object> proto) {
 //   the class's prototype.
 void nx_webgl_init_class(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
-	if (!st) st = new WebGLState();
+	// (no per-context state needed here — g_protos + method install are global;
+	// the per-canvas WebGLState is created in make_context_carrier.)
 	if (info.Length() < 1 || !info[0]->IsFunction()) return;
 	Local<Function> cls = info[0].As<Function>();
 	Local<Context> ctx = cur(iso);
@@ -6877,7 +6933,7 @@ void nx_webgl_init_class(const FunctionCallbackInfo<Value> &info) {
 		if (!jc.As<Function>()->Get(ctx, nx_str(iso, "prototype")).ToLocal(&p))
 			continue;
 		if (!p->IsObject()) continue;
-		st->protos[kv.kind].Reset(iso, p.As<Object>());
+		g_protos[kv.kind].Reset(iso, p.As<Object>());
 	}
 }
 
@@ -6890,7 +6946,8 @@ void nx_webgl_init_class(const FunctionCallbackInfo<Value> &info) {
 // JIT-safety rationale block).
 void nx_webgl2_init_class(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
-	if (!st) st = new WebGLState();
+	// (no per-context state needed here — g_protos + method install are global;
+	// the per-canvas WebGLState is created in make_context_carrier.)
 	if (info.Length() < 1 || !info[0]->IsFunction()) return;
 	Local<Function> cls = info[0].As<Function>();
 	Local<Context> ctx = cur(iso);
@@ -6944,8 +7001,8 @@ void nx_webgl2_init_class(const FunctionCallbackInfo<Value> &info) {
 		// order. The IsEmpty() check here is a defensive no-op against
 		// future re-orderings (e.g. if v1 is ever decoupled from v2's
 		// handle exports and runs first).
-		if (st->protos[kv.kind].IsEmpty()) {
-			st->protos[kv.kind].Reset(iso, p.As<Object>());
+		if (g_protos[kv.kind].IsEmpty()) {
+			g_protos[kv.kind].Reset(iso, p.As<Object>());
 		}
 	}
 	fprintf(stderr, "[webgl2] init_class ok (empty v2 method table; "
@@ -6957,11 +7014,25 @@ void nx_webgl2_init_class(const FunctionCallbackInfo<Value> &info) {
 // empty Local<Object>() on failure (caller sets info return to undefined ->
 // TS createWebGL*Context returns null). `is_v2` tags the carrier so engine-
 // side dispatchers added in 2.G.1+ can branch on context kind.
+// GC finalizer for a per-context WebGLState (attached via nx::Wrap in
+// make_context_carrier). Runs during V8 GC where the shared GL context is NOT
+// current — so it must NOT issue any GL calls. It queues the context's tenant
+// FBO id for deletion at the next GL-current point (enter_bracket /
+// make_context_carrier via process_pending_tenant_frees) and frees the CPU
+// struct. The tenant's auto_user_vao + any GL names the context created leak
+// until bridge teardown (same as the pre-multi-context behavior — the finalizer
+// has no GL context); the tenant FBO is the significant allocation and IS
+// reclaimed. tenant_id 0 (the shared default) is never freed here.
+void free_webgl_state(WebGLState *s) {
+	if (!s) return;
+	if (s->tenant_id != 0) g_tenants_to_free.push_back(s->tenant_id);
+	if (st == s) st = nullptr; // don't leave `st` dangling at the freed state
+	delete s;
+}
+
 static Local<Object> make_context_carrier(Isolate *iso,
                                           const FunctionCallbackInfo<Value> &info,
                                           bool is_v2) {
-	if (!st) st = new WebGLState();
-
 	// Skia must be up — without the shared ES3 context + GrDirectContext,
 	// the bridge can't init. Caller (TS) treats this as "no GL available".
 	if (!nx_skia_gpu_egl_context() || !nx_skia_gpu_gr_context()) {
@@ -6971,8 +7042,12 @@ static Local<Object> make_context_carrier(Isolate *iso,
 		return Local<Object>();
 	}
 
+	// Reclaim any tenants whose contexts were GC'd (GL is current here — the
+	// GC finalizer only queued the ids). See free_webgl_state.
+	process_pending_tenant_frees();
+
 	// Read canvas dimensions if a canvas was passed.
-	int w = st->width, h = st->height;
+	int w = 640, h = 360;
 	if (info.Length() >= 1 && info[0]->IsObject()) {
 		Local<Object> canvas = info[0].As<Object>();
 		Local<Context> ctx = cur(iso);
@@ -6986,21 +7061,126 @@ static Local<Object> make_context_carrier(Isolate *iso,
 	}
 	if (w <= 0) w = 640;
 	if (h <= 0) h = 360;
-	st->width = w;
-	st->height = h;
 
-	// Bring up the tenant FBO lazily (if 2.B's test_fbo opt-in hasn't
-	// already done so). The bridge is idempotent on init.
+	// Allocate a FRESH per-context WebGLState (multi-WebGL-canvas independence)
+	// and make it active. Each page <canvas> gets its own state + its own
+	// bridge tenant id: 0 for the first context (reuses the legacy default
+	// tenant, zero extra GPU), 1,2,... for stacked canvases. The state is
+	// attached to the returned carrier via nx::Wrap so use_ctx(info.This())
+	// selects it on every method call; free_webgl_state frees it at GC.
+	WebGLState *cst = new WebGLState();
+	cst->tenant_id = g_next_tenant_id++;
+	cst->width = w;
+	cst->height = h;
+	st = cst;
+
+	// Bring up the bridge (creates the default tenant 0) on the first context.
 	if (!nx_webgl_bridge_is_initialized()) {
 		if (!nx_webgl_bridge_init(w, h)) {
 			fprintf(stderr,
 			        "[webgl%s] context_new refused: bridge_init failed\n",
 			        is_v2 ? "2" : "");
 			fflush(stderr);
+			st = nullptr;
+			delete cst;
 			return Local<Object>();
 		}
 	}
+	// Ensure THIS canvas's tenant FBO exists (id 0 == the default just created;
+	// >0 == a dedicated per-canvas FBO so stacked WebGL canvases are isolated).
+	if (!nx_webgl_bridge_tenant_ensure(cst->tenant_id, w, h)) {
+		fprintf(stderr,
+		        "[webgl%s] context_new refused: tenant %u ensure failed\n",
+		        is_v2 ? "2" : "", cst->tenant_id);
+		fflush(stderr);
+		st = nullptr;
+		delete cst;
+		return Local<Object>();
+	}
 	nx_webgl_bridge_set_webgl_owned(true);
+
+	// ── Multi-canvas set-once persistence fix (2026-09-10) ──────────────────
+	// Seed THIS fresh context's user_snap with clean WebGL default state NOW, at
+	// creation, and mark it valid — so apply_canvas_state ALWAYS takes the
+	// RESTORE branch for this context and NEVER the lazy SAVE branch.
+	//
+	// The bug this fixes (pinned by per-op native instrumentation): the SAVE
+	// branch used to fire LATE — at the context's first *fresh* per-frame
+	// bracket, which for a page context lands mid-app-init because the shell's
+	// bracket is already open during the app's setup calls (so those setters'
+	// enter_bracket early-returns and never triggers the SAVE). By the time the
+	// SAVE finally ran, the app had already shadow-written its intended state
+	// into user_snap (program=25, clearColor=0.04, its own VAO), and
+	// nx_gl_state_save OVERWROTE all of it with whatever Skia had left live
+	// (program 7, clearColor 0,0,0, the auto VAO). Every later frame then
+	// RESTORED that clobbered snapshot → the app's program was never current
+	// (uniform* → GL_INVALID_OPERATION 0x502) and clears were black. Re-emit
+	// apps (three.js / dusk / the shell wallpaper / the multiwebgl demo) only
+	// survived by re-issuing full GL state every frame, which repaired the
+	// snapshot each frame — set-once apps (compass / midisurface /
+	// nxjswebgl2test / gravityballs / glsingletest) had nothing to repair it.
+	//
+	// Seeding here — before ANY app GL call — establishes valid=true up front,
+	// so the destructive SAVE never runs and the app's init shadow-writes
+	// accumulate on a correct baseline and RESTORE faithfully every frame. This
+	// mirrors why the pre-regression shared context (tenant 0) always worked:
+	// its user_snap was captured while GL was in clean defaults. Uses
+	// nx_gl_state_save (not hand-filled fields) so the dynamic entries — tenant
+	// FBO id, the auto VAO name, GL_TEXTURE0 as the active unit — are captured
+	// correctly rather than guessed. Skia's live GL state is saved and restored
+	// around the seed so the shell's in-flight frame is undisturbed.
+	{
+		nx_gl_state_snap_t skia_snap;
+		nx_gl_state_save(&skia_snap);
+		// Bind this context's tenant FBO (read+draw) so the captured
+		// user_snap.fbo / read_fbo point at the tenant, matching apply's bind.
+		glBindFramebuffer(GL_FRAMEBUFFER, nx_webgl_bridge_tenant_fbo(cst->tenant_id));
+		// Allocate + bind the persistence VAO so WebGL-1 attribute state has a
+		// home Ganesh doesn't touch; the capture records it as the baseline VAO.
+		if (cst->auto_user_vao == 0) glGenVertexArrays(1, &cst->auto_user_vao);
+		glBindVertexArray(cst->auto_user_vao);
+		// Drive live GL to WebGL spec defaults, then capture into user_snap.
+		glUseProgram(0);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+		glDepthMask(GL_TRUE);
+		glStencilMask(0xFFFFFFFFu);
+		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+		glDisable(GL_BLEND);
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_SCISSOR_TEST);
+		glDisable(GL_STENCIL_TEST);
+		glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ZERO);
+		glActiveTexture(GL_TEXTURE0);
+		glBindSampler(0, 0);           // ES 3.x shared ctx; safe for v1 + v2
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+		nx_gl_state_save(&cst->user_snap);
+		cst->user_snap_valid = true;
+		// Put Skia's live GL state back — do NOT leave the shell disturbed.
+		nx_gl_state_restore(&skia_snap);
+		GrDirectContext *gr = nx_skia_gpu_gr_context();
+		if (gr) gr->resetContext();
+	}
+
+	// WebGL-1 attribute-VAO fix (2026-09-10): if the shell's per-frame bracket
+	// is ALREADY OPEN when the app calls getContext (the common case — the app
+	// inits mid-frame), the app's upcoming init GL calls will find st==cst AND
+	// the bracket open, so NEITHER use_ctx (no context switch — st is already
+	// cst) NOR enter_bracket (already open) runs apply_canvas_state(). That
+	// leaves the PREVIOUS context's VAO bound, so a WebGL-1 app's
+	// enableVertexAttribArray/vertexAttribPointer (which have no explicit VAO —
+	// they rely on this context's auto_user_vao) land on the WRONG VAO. At draw
+	// the correct-but-empty auto VAO is bound → no geometry (this was proven by
+	// per-op native instrumentation: the app's attribute setup bound the
+	// previous context's VAO, and attrib 0 was disabled with no buffer at draw).
+	// WebGL-2 apps escape this because they bindVertexArray(ownVAO) explicitly.
+	// Apply cst's canvas state NOW (binds its tenant FBO + auto VAO + seeded
+	// snapshot) so init calls land on the right VAO. Mirrors use_ctx's
+	// mid-bracket apply; harmless when the bracket is closed (skipped — the
+	// app's first GL call will open a bracket and apply then).
+	if (g_bracket_open) apply_canvas_state();
 
 	// Phase-0 — populate the native GL extension cache and emit the
 	// [gl-ext-dump] one-shot boot log. Bridge init above guarantees the
@@ -7014,6 +7194,11 @@ static Local<Object> make_context_carrier(Isolate *iso,
 	// WebGL{2}RenderingContext, so install_methods{,_v2} having populated the
 	// prototype is what makes instance methods reachable.
 	Local<Object> ctx_obj = nx::NewWrapped(iso);
+	// Attach THIS context's per-canvas WebGLState so use_ctx(info.This()) can
+	// select it on every method call (multi-WebGL-canvas independence). GC of
+	// the carrier frees the state via free_webgl_state (which queues the tenant
+	// FBO for a GL-current delete).
+	nx::Wrap<WebGLState>(iso, ctx_obj, cst, free_webgl_state);
 	Local<Context> jctx = cur(iso);
 	ctx_obj->Set(jctx, nx_str(iso, "drawingBufferWidth"),
 	             Int32::New(iso, w)).Check();
@@ -7073,7 +7258,7 @@ void nx_webgl_exit(void) {}
 // the call is cheap on frames where WebGL didn't draw.
 void nx_webgl_compose_if_active(SkSurface *target) {
 	if (!st) return;
-	if (st->bracket_open) exit_bracket();
+	if (g_bracket_open) exit_bracket();
 	if (target) nx_webgl_bridge_compose(target);
 }
 
@@ -7108,10 +7293,13 @@ bool nx_webgl_snapshot_bridge_rgba8(int *out_w, int *out_h,
                                      uint8_t **out_bgra) {
 	if (!out_w || !out_h || !out_bgra) return false;
 	if (!nx_webgl_bridge_is_initialized()) return false;
-	GLuint fbo = nx_webgl_bridge_fbo_id();
+	// Snapshot the ACTIVE context's tenant FBO (multi-WebGL-canvas: `st` is the
+	// last-active context). Falls back to the default tenant when no context.
+	const uint32_t tid = st ? st->tenant_id : 0;
+	GLuint fbo = nx_webgl_bridge_tenant_fbo(tid);
 	if (fbo == 0) return false;
 	int fbo_w = 0, fbo_h = 0;
-	nx_webgl_bridge_fbo_size(&fbo_w, &fbo_h);
+	nx_webgl_bridge_tenant_size(tid, &fbo_w, &fbo_h);
 	if (fbo_w <= 0 || fbo_h <= 0) return false;
 
 	// Save the two GL states we're about to touch. Values 0 (default binding)

@@ -112,13 +112,21 @@ export class Screen extends EventTarget implements globalThis.Screen {
 	declare readonly height: number;
 
 	getContext(contextId: '2d'): CanvasRenderingContext2D;
-	getContext(contextId: 'webgl' | 'experimental-webgl'): WebGLRenderingContext | null;
-	getContext(contextId: 'webgl2'): WebGL2RenderingContext | null;
-	getContext(contextId: string): null;
+	getContext(contextId: 'webgl' | 'experimental-webgl', options?: unknown): WebGLRenderingContext | null;
+	getContext(contextId: 'webgl2', options?: unknown): WebGL2RenderingContext | null;
+	getContext(contextId: string, options?: unknown): null;
 	getContext(
 		contextId: string,
+		options?: unknown,
 	): CanvasRenderingContext2D | WebGLRenderingContext | WebGL2RenderingContext | null {
 		const i = _(this);
+		// brewser multi-WebGL-canvas support: with `{ __brewserNewContext: true }`
+		// the WebGL branches mint a FRESH engine context (its own per-canvas
+		// tenant FBO) instead of returning the cached screen context, so the
+		// runtime can back each page <canvas> with an independent WebGL context.
+		// The cached-context behavior (all other callers) is unchanged.
+		const forceNewWebGL = !!(options && typeof options === 'object' &&
+			(options as { __brewserNewContext?: unknown }).__brewserNewContext);
 		if (contextId === '2d') {
 			// The screen may only have one context kind (per the HTML canvas
 			// spec): once a WebGL context exists, '2d' returns null.
@@ -155,6 +163,11 @@ export class Screen extends EventTarget implements globalThis.Screen {
 		// engine composites both into the screen surface before present).
 		// So NO cross-family exclusions at all in the WebGL branches.
 		if (contextId === 'webgl' || contextId === 'experimental-webgl') {
+			if (forceNewWebGL) {
+				// Fresh context with its own per-canvas tenant FBO; NOT cached
+				// (the caller owns it). Enables independent stacked WebGL canvases.
+				return createWebGLContext(this);
+			}
 			if (!i.contextWebGL) {
 				const ctx = createWebGLContext(this);
 				if (!ctx) return null;
@@ -172,6 +185,10 @@ export class Screen extends EventTarget implements globalThis.Screen {
 			// detection works) but every method call throws `TypeError: X
 			// is not a function` until 2.G.1 lands the webgl2-ubo slice's
 			// method allowlist. See MIGRATION_PLAN.md Phase 2.G.0.
+			if (forceNewWebGL) {
+				// Fresh v2 context with its own per-canvas tenant FBO; NOT cached.
+				return createWebGL2Context(this);
+			}
 			if (!i.contextWebGL2) {
 				const ctx = createWebGL2Context(this);
 				if (!ctx) return null;

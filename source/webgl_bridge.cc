@@ -1,9 +1,11 @@
 #include "webgl_bridge.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unordered_map>
 
 #include "include/core/SkBlendMode.h"
 #include "include/core/SkCanvas.h"
@@ -142,9 +144,15 @@ GLuint compile_shader(GLenum type, const char *src) {
 	return sh;
 }
 
-bool create_fbo(int w, int h) {
-	glGenTextures(1, &s_color_tex);
-	glBindTexture(GL_TEXTURE_2D, s_color_tex);
+// Create a color-texture + depth24-stencil8 + FBO trio of the given size into
+// caller-owned out-params. Generalized from the original single-tenant
+// create_fbo so per-canvas tenants (multi-WebGL-canvas independence) allocate
+// byte-identical resources. Leaves FBO 0 bound on both success and failure.
+bool create_fbo_resources(int w, int h, GLuint *out_fbo, GLuint *out_color,
+                          GLuint *out_depth) {
+	GLuint color_tex = 0, depth_rb = 0, fbo = 0;
+	glGenTextures(1, &color_tex);
+	glBindTexture(GL_TEXTURE_2D, color_tex);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
 	             GL_UNSIGNED_BYTE, nullptr);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -161,16 +169,16 @@ bool create_fbo(int w, int h) {
 	// depth attachment goes through the SAME renderbuffer via the combined
 	// DEPTH_STENCIL_ATTACHMENT point (single attach, ES3-preferred), so
 	// DEPTH_BITS still reports 24. See NXJS_PATCHES_NEEDED.md #46.
-	glGenRenderbuffers(1, &s_depth_rb);
-	glBindRenderbuffer(GL_RENDERBUFFER, s_depth_rb);
+	glGenRenderbuffers(1, &depth_rb);
+	glBindRenderbuffer(GL_RENDERBUFFER, depth_rb);
 	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
 
-	glGenFramebuffers(1, &s_fbo);
-	glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-	                       s_color_tex, 0);
+	                       color_tex, 0);
 	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
-	                          GL_RENDERBUFFER, s_depth_rb);
+	                          GL_RENDERBUFFER, depth_rb);
 	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
 	// Unbind BEFORE checking status so the failure path leaves Skia's FBO 0
 	// current rather than our incomplete tenant.
@@ -183,6 +191,9 @@ bool create_fbo(int w, int h) {
 		        "[bridge-fbo:INCOMPLETE] status=0x%x — DEPTH24_STENCIL8 attach failed\n",
 		        (unsigned)status);
 		fflush(stderr);
+		if (fbo) glDeleteFramebuffers(1, &fbo);
+		if (color_tex) glDeleteTextures(1, &color_tex);
+		if (depth_rb) glDeleteRenderbuffers(1, &depth_rb);
 		return false;
 	}
 	// Positive-path breadcrumb for the same gate; the assert holds when this
@@ -191,7 +202,14 @@ bool create_fbo(int w, int h) {
 	        "[bridge-fbo:complete] %dx%d color=RGBA8 depth=24 stencil=8 (combined attach)\n",
 	        w, h);
 	fflush(stderr);
+	*out_fbo = fbo;
+	*out_color = color_tex;
+	*out_depth = depth_rb;
 	return true;
+}
+
+bool create_fbo(int w, int h) {
+	return create_fbo_resources(w, h, &s_fbo, &s_color_tex, &s_depth_rb);
 }
 
 bool create_test_program(void) {
@@ -278,30 +296,88 @@ void render_test_into_fbo(float t) {
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
-void wrap_compose_image(void) {
-	// Borrow the tenant FBO color texture as an SkImage. Borrowing means
-	// Skia does NOT own the GL handle — webgl_bridge keeps owning it,
-	// must outlive any Skia draw that references the image, and frees it
-	// in nx_webgl_bridge_exit BEFORE the GrDirectContext goes away.
+// Borrow a color texture as an SkImage. Borrowing means Skia does NOT own the
+// GL handle — webgl_bridge keeps owning it, must outlive any Skia draw that
+// references the image, and frees it before the GrDirectContext goes away.
+// Generalized from wrap_compose_image so per-canvas tenants can each borrow
+// their own color texture.
+sk_sp<SkImage> borrow_fbo_image(GLuint color_tex, int w, int h) {
 	GrGLTextureInfo tinfo;
 	tinfo.fTarget = GL_TEXTURE_2D;
-	tinfo.fID = s_color_tex;
+	tinfo.fID = color_tex;
 	tinfo.fFormat = 0x8058; // GL_RGBA8
-	GrBackendTexture btex = GrBackendTextures::MakeGL(s_fbo_w, s_fbo_h,
+	GrBackendTexture btex = GrBackendTextures::MakeGL(w, h,
 	                                                  skgpu::Mipmapped::kNo,
 	                                                  tinfo);
 	GrDirectContext *gr = nx_skia_gpu_gr_context();
-	if (!gr) {
-		s_compose_image.reset();
-		return;
-	}
-	s_compose_image = SkImages::BorrowTextureFrom(
+	if (!gr) return nullptr;
+	sk_sp<SkImage> img = SkImages::BorrowTextureFrom(
 	    gr, btex, kBottomLeft_GrSurfaceOrigin, kRGBA_8888_SkColorType,
 	    kPremul_SkAlphaType, nullptr);
-	if (!s_compose_image) {
+	if (!img) {
 		fprintf(stderr, "[webgl-bridge] SkImages::BorrowTextureFrom failed\n");
 		fflush(stderr);
 	}
+	return img;
+}
+
+void wrap_compose_image(void) {
+	s_compose_image = borrow_fbo_image(s_color_tex, s_fbo_w, s_fbo_h);
+}
+
+// ---------------------------------------------------------------------------
+// Per-canvas tenant registry (multi-WebGL-canvas independence).
+//
+// tenant_id 0 is the legacy/default tenant backed by the globals above
+// (s_fbo / s_color_tex / s_depth_rb / s_fbo_w/h / s_fbo_dirty /
+// s_compose_image) — single-canvas apps and the shell are byte-for-byte
+// unchanged. tenant_id > 0 lives in this map, one entry per additional page
+// WebGL canvas, so two stacked canvases draw into independent FBOs and each
+// composites its own contents into its own DOM slot.
+// ---------------------------------------------------------------------------
+struct ExtraTenant {
+	GLuint fbo = 0;
+	GLuint color_tex = 0;
+	GLuint depth_rb = 0;
+	int w = 0;
+	int h = 0;
+	bool dirty = false;
+	sk_sp<SkImage> image;
+};
+std::unordered_map<uint32_t, ExtraTenant> s_extra_tenants;
+
+// Free an ExtraTenant's GL handles + SkImage. GL must be current.
+void destroy_extra_tenant(ExtraTenant &t) {
+	t.image.reset();
+	if (t.fbo) { glDeleteFramebuffers(1, &t.fbo); t.fbo = 0; }
+	if (t.color_tex) { glDeleteTextures(1, &t.color_tex); t.color_tex = 0; }
+	if (t.depth_rb) { glDeleteRenderbuffers(1, &t.depth_rb); t.depth_rb = 0; }
+}
+
+// Shared sub-rect blit of a borrowed FBO SkImage onto `target`. Factored from
+// nx_webgl_bridge_compose_rect so per-canvas tenants reuse the exact same
+// Y-flip + clip + 3-arg-drawImageRect discipline (see the cut #12/#13 notes on
+// the caller). `fbo_w/h` are the tenant's dims (drive the Y-flip complement).
+bool compose_image_rect(SkSurface *target, const sk_sp<SkImage> &img,
+                        int fbo_w, int fbo_h, int src_x, int src_y, int src_w,
+                        int src_h, int dst_x, int dst_y) {
+	if (!target || !img) return false;
+	if (src_w <= 0 || src_h <= 0) return false;
+	SkCanvas *c = target->getCanvas();
+	if (!c) return false;
+	const int visual_sy = fbo_h - src_y - src_h;
+	const float draw_dx = (float)dst_x - (float)src_x;
+	const float draw_dy = (float)dst_y - (float)visual_sy;
+	c->save();
+	c->clipRect(SkRect::MakeXYWH((float)dst_x, (float)dst_y, (float)src_w,
+	                             (float)src_h));
+	SkPaint paint;
+	c->drawImageRect(img.get(),
+	                 SkRect::MakeXYWH(draw_dx, draw_dy, (float)fbo_w,
+	                                  (float)fbo_h),
+	                 SkSamplingOptions(), &paint);
+	c->restore();
+	return true;
 }
 
 } // namespace
@@ -763,6 +839,9 @@ void nx_webgl_bridge_exit(void) {
 	// Drop the Skia-side SkImage FIRST so the GrDirectContext stops
 	// referencing the tenant color texture, THEN free the GL handles.
 	s_compose_image.reset();
+	// Free all per-canvas extra tenants (multi-WebGL-canvas independence).
+	for (auto &kv : s_extra_tenants) destroy_extra_tenant(kv.second);
+	s_extra_tenants.clear();
 	if (s_test_vao)  { glDeleteVertexArrays(1, &s_test_vao); s_test_vao = 0; }
 	if (s_test_vbo)  { glDeleteBuffers(1, &s_test_vbo); s_test_vbo = 0; }
 	if (s_test_prog) { glDeleteProgram(s_test_prog); s_test_prog = 0; }
@@ -851,19 +930,93 @@ bool nx_webgl_bridge_compose_rect(SkSurface *target,
 	// nx_webgl_egl_read_bridge_to_canvas_data contract). Skia's
 	// drawImageRect src is in visual/top-down coords on a kBottomLeft
 	// SkImage, so we convert with visual_sy = FBO_h - src_y - src_h.
-	const int visual_sy = s_fbo_h - src_y - src_h;
-	const float draw_dx = (float)dst_x - (float)src_x;
-	const float draw_dy = (float)dst_y - (float)visual_sy;
-	c->save();
-	c->clipRect(SkRect::MakeXYWH((float)dst_x, (float)dst_y,
-	                             (float)src_w, (float)src_h));
-	SkPaint paint;
-	c->drawImageRect(s_compose_image.get(),
-	                 SkRect::MakeXYWH(draw_dx, draw_dy,
-	                                  (float)s_fbo_w, (float)s_fbo_h),
-	                 SkSamplingOptions(), &paint);
-	c->restore();
-	return true;
+	return compose_image_rect(target, s_compose_image, s_fbo_w, s_fbo_h,
+	                          src_x, src_y, src_w, src_h, dst_x, dst_y);
+}
+
+// ---------------------------------------------------------------------------
+// Per-canvas tenant registry — public API (multi-WebGL-canvas independence).
+// tenant_id 0 = the legacy/default tenant (globals); >0 = s_extra_tenants.
+// ---------------------------------------------------------------------------
+bool nx_webgl_bridge_tenant_ensure(uint32_t id, int w, int h) {
+	if (w <= 0 || h <= 0) return false;
+	if (id == 0) {
+		// Default tenant: created once by nx_webgl_bridge_init at the first
+		// context's size and intentionally NOT resized here (matches the
+		// pre-existing single-tenant behavior — single-canvas apps unchanged).
+		if (!s_initialized) return nx_webgl_bridge_init(w, h);
+		return s_fbo != 0;
+	}
+	if (!s_initialized) return false; // shared ES3 context/bridge must be up
+	ExtraTenant &t = s_extra_tenants[id];
+	if (t.fbo && t.w == w && t.h == h) return true;   // already sized
+	if (t.fbo) destroy_extra_tenant(t);               // resize -> rebuild
+	if (!create_fbo_resources(w, h, &t.fbo, &t.color_tex, &t.depth_rb)) {
+		s_extra_tenants.erase(id);
+		return false;
+	}
+	t.w = w;
+	t.h = h;
+	t.dirty = false;
+	t.image = borrow_fbo_image(t.color_tex, w, h);
+	fprintf(stderr, "[webgl-bridge] tenant %u created %dx%d fbo=%u\n", id, w, h,
+	        t.fbo);
+	fflush(stderr);
+	return t.fbo != 0;
+}
+
+GLuint nx_webgl_bridge_tenant_fbo(uint32_t id) {
+	if (id == 0) return s_initialized ? s_fbo : 0;
+	auto it = s_extra_tenants.find(id);
+	return (it != s_extra_tenants.end()) ? it->second.fbo : 0;
+}
+
+void nx_webgl_bridge_tenant_size(uint32_t id, int *out_w, int *out_h) {
+	int w = 0, h = 0;
+	if (id == 0) {
+		if (s_initialized) { w = s_fbo_w; h = s_fbo_h; }
+	} else {
+		auto it = s_extra_tenants.find(id);
+		if (it != s_extra_tenants.end()) { w = it->second.w; h = it->second.h; }
+	}
+	if (out_w) *out_w = w;
+	if (out_h) *out_h = h;
+}
+
+void nx_webgl_bridge_tenant_mark_dirty(uint32_t id) {
+	if (id == 0) {
+		if (s_initialized) s_fbo_dirty = true;
+		return;
+	}
+	auto it = s_extra_tenants.find(id);
+	if (it != s_extra_tenants.end()) it->second.dirty = true;
+}
+
+bool nx_webgl_bridge_tenant_compose_rect(SkSurface *target, uint32_t id,
+                                         int src_x, int src_y, int src_w,
+                                         int src_h, int dst_x, int dst_y) {
+	if (id == 0) {
+		return nx_webgl_bridge_compose_rect(target, src_x, src_y, src_w, src_h,
+		                                    dst_x, dst_y);
+	}
+	auto it = s_extra_tenants.find(id);
+	if (it == s_extra_tenants.end()) return false;
+	ExtraTenant &t = it->second;
+	// Re-borrow each call (same Ganesh frozen-snapshot reason as cut #12).
+	t.image = borrow_fbo_image(t.color_tex, t.w, t.h);
+	return compose_image_rect(target, t.image, t.w, t.h, src_x, src_y, src_w,
+	                          src_h, dst_x, dst_y);
+}
+
+void nx_webgl_bridge_tenant_destroy(uint32_t id) {
+	if (id == 0) return; // default tenant is freed by nx_webgl_bridge_exit
+	auto it = s_extra_tenants.find(id);
+	if (it != s_extra_tenants.end()) {
+		destroy_extra_tenant(it->second);
+		s_extra_tenants.erase(it);
+		fprintf(stderr, "[webgl-bridge] tenant %u destroyed\n", id);
+		fflush(stderr);
+	}
 }
 
 // Production WebGL → Skia compose path. Cheap no-op on idle frames (no dirty,

@@ -39,8 +39,19 @@ void close_image(nx_image_t *image) {
 void user_read_data(png_structp png_ptr, png_bytep data, png_size_t length) {
 	struct buffer_state *state =
 	    (struct buffer_state *)png_get_io_ptr(png_ptr);
+	// Bounds-check every read against the bytes remaining. A truncated or
+	// malformed PNG makes libpng request more than the buffer holds; the old
+	// unconditional memcpy read past the end of the input (OOB → segfault).
+	// `state->size` tracks REMAINING bytes and is decremented as we consume.
+	// On overrun, raise a libpng error, which longjmps to the setjmp in
+	// decode_png (turning the crash into a clean decode failure / .onerror).
+	if (!state || length > state->size) {
+		png_error(png_ptr, "read past end of image buffer");
+		return; // not reached — png_error longjmps
+	}
 	memcpy(data, state->ptr, length);
 	state->ptr += length;
+	state->size -= length;
 }
 
 enum ImageFormat identify_image_format(uint8_t *data, size_t size) {
@@ -254,7 +265,30 @@ uint8_t *decode_png(uint8_t *input, size_t input_size, u32 *width,
                     u32 *height) {
 	png_structp png_ptr =
 	    png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+	if (!png_ptr)
+		return NULL;
 	png_infop info_ptr = png_create_info_struct(png_ptr);
+	if (!info_ptr) {
+		png_destroy_read_struct(&png_ptr, NULL, NULL);
+		return NULL;
+	}
+	// libpng reports EVERY decode failure (bad header, truncated IDAT, CRC
+	// mismatch, unsupported feature, ...) by longjmp-ing back to a setjmp
+	// point. Without one, its default handler longjmps through an
+	// uninitialized jmp_buf and segfaults this worker thread with no catchable
+	// JS error. Establish the target and treat any error as a clean decode
+	// failure: return NULL, which the caller maps to an `error` event on the
+	// Image (nx_decode_image_do -> "Image decode was not initialized").
+	// `image_data` / `rows` are read in the longjmp handler, so they are
+	// `volatile` (their post-longjmp value must be their last stored value).
+	uint8_t *volatile image_data = NULL;
+	png_bytep *volatile rows = NULL;
+	if (setjmp(png_jmpbuf(png_ptr))) {
+		free((void *)image_data);
+		free((void *)rows);
+		png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+		return NULL;
+	}
 	struct buffer_state state = {input, input_size};
 	png_set_read_fn(png_ptr, &state, user_read_data);
 	png_read_info(png_ptr, info_ptr);
@@ -271,22 +305,23 @@ uint8_t *decode_png(uint8_t *input, size_t input_size, u32 *width,
 		png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
 		return NULL;
 	}
-	uint8_t *image_data = (uint8_t *)malloc(4 * (size_t)(*width) * (*height));
-	png_bytep *rows = (png_bytep *)malloc(sizeof(png_bytep) * (*height));
+	image_data = (uint8_t *)malloc(4 * (size_t)(*width) * (*height));
+	rows = (png_bytep *)malloc(sizeof(png_bytep) * (*height));
 	if (!image_data || !rows) {
-		free(image_data);
-		free(rows);
+		free((void *)image_data);
+		free((void *)rows);
 		png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
 		return NULL;
 	}
 	for (u32 i = 0; i < *height; ++i)
 		rows[i] = image_data + i * 4 * (*width);
-	png_read_image(png_ptr, rows);
-	free(rows);
+	png_read_image(png_ptr, (png_bytepp)rows);
+	free((void *)rows);
+	rows = NULL;
 	png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
 	if (has_alpha)
-		premultiply_alpha(image_data, *width, *height);
-	return image_data;
+		premultiply_alpha((uint8_t *)image_data, *width, *height);
+	return (uint8_t *)image_data;
 }
 
 uint8_t *decode_webp(uint8_t *webp_data, size_t data_size, int *width,

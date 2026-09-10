@@ -229,6 +229,31 @@ bool nx_webgl_bridge_compose_rect(SkSurface *target,
                                   int src_x, int src_y, int src_w, int src_h,
                                   int dst_x, int dst_y);
 
+// ---- Per-canvas tenant registry (multi-WebGL-canvas independence) ----------
+// Each page WebGL canvas owns its own tenant FBO so stacked canvases render
+// independently (the tetr.io #pixi + #pixi-fg case). tenant_id 0 is the
+// legacy/default tenant created by nx_webgl_bridge_init — single-canvas apps +
+// the shell are byte-for-byte unchanged. id > 0 lives in an internal map, one
+// per additional canvas.
+//   ensure       — create (or, for id>0, resize) the tenant; false on failure.
+//   fbo          — the tenant's GL framebuffer name (0 if absent). Bound as the
+//                  canvas's "default framebuffer".
+//   size         — the tenant's w/h (drives the compose Y-flip).
+//   mark_dirty   — flag the tenant touched this frame.
+//   compose_rect — blit a sub-rect of the tenant onto `target` at (dst_x,dst_y).
+//   destroy      — free the tenant's GL handles + SkImage (id>0 only). GL MUST
+//                  be current — call from a GL-current path, never a GC
+//                  finalizer (webgl.cc defers finalizer frees to enter_bracket).
+#include <stdint.h>
+bool   nx_webgl_bridge_tenant_ensure(uint32_t id, int w, int h);
+GLuint nx_webgl_bridge_tenant_fbo(uint32_t id);
+void   nx_webgl_bridge_tenant_size(uint32_t id, int *out_w, int *out_h);
+void   nx_webgl_bridge_tenant_mark_dirty(uint32_t id);
+bool   nx_webgl_bridge_tenant_compose_rect(SkSurface *target, uint32_t id,
+                                           int src_x, int src_y, int src_w,
+                                           int src_h, int dst_x, int dst_y);
+void   nx_webgl_bridge_tenant_destroy(uint32_t id);
+
 // Phase 2.G.0 — state-contract probe controls + read-only logger.
 //
 // The probe is GATED by `[webgl] state_probe = true` (config.h::webgl_state_probe).
