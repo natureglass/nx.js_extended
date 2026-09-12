@@ -35,6 +35,19 @@ export * from './video-decoder';
 export { Socket, Server };
 export { WebApplet, type WebAppletOptions } from '../web-applet';
 
+/**
+ * Install a veto consulted before `fetch` follows a redirect.
+ *
+ * Surfaced on the `Switch` namespace because that is the only value seam an
+ * embedder has — `@nx.js/runtime` is types-only to consumers, its values are
+ * globals installed by this runtime.
+ *
+ * Embedders that sandbox app code MUST hide this from that code: a page able
+ * to clear the guard can undo the very check the embedder installed. The
+ * brewser runtime does so through its `Switch` proxy.
+ */
+export { setFetchRedirectGuard, type RedirectGuard } from '../fetch/fetch';
+
 export type PathLike = string | URL;
 
 export interface Versions {

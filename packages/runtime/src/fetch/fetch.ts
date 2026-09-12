@@ -16,6 +16,31 @@ import { Headers } from './headers';
 import { Request, type RequestInit } from './request';
 import { Response } from './response';
 
+/**
+ * Optional veto consulted before a redirect is followed.
+ *
+ * Redirects are followed inside this module, so a caller that gated the URL it
+ * asked for has no say in where it actually ends up: a server it was permitted
+ * to reach can answer with a 30x to one it was not. An embedder that enforces
+ * a per-origin policy (brewser gates `http(s)` on the app manifest's declared
+ * `allowed_origins`) installs a guard here and re-checks every hop.
+ *
+ * Return false to refuse the hop; `fetch` then rejects with a TypeError rather
+ * than silently continuing. Unset by default, so stock nx.js behaviour is
+ * unchanged.
+ *
+ * @param url The absolute redirect target.
+ * @param from The URL that issued the redirect.
+ */
+export type RedirectGuard = (url: string, from: string) => boolean;
+
+let redirectGuard: RedirectGuard | null = null;
+
+/** Install (or clear, with `null`) the redirect guard. */
+export function setFetchRedirectGuard(guard: RedirectGuard | null): void {
+	redirectGuard = guard;
+}
+
 function indexOfEol(arr: ArrayLike<number>, offset: number): number {
 	for (let i = offset; i < arr.length - 1; i++) {
 		if (arr[i] === 13 && arr[i + 1] === 10) {
@@ -310,6 +335,15 @@ async function fetchHttp(
 				);
 			}
 			const redirectUrl = new URL(loc, req.url);
+
+			// Re-gate the hop. The embedder's policy is about which origins may
+			// be reached, not about which URL was typed first.
+			if (redirectGuard && !redirectGuard(redirectUrl.href, String(url))) {
+				throw new TypeError(
+					`Redirect from "${url}" to "${redirectUrl.href}" was refused`,
+				);
+			}
+
 			let method: RequestInit['method'] = 'GET';
 			let redirectBody: Uint8Array | null = null;
 			if (status === 307 || status === 308) {

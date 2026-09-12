@@ -902,6 +902,26 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 		// during playback) indefinitely. 30 s (in microseconds) is generous
 		// for a LAN transcode while still guaranteeing forward progress.
 		av_dict_set(&net_opts, "rw_timeout", "30000000", 0);
+		// Protocol allow-list. libavformat will otherwise open ANY compiled-in
+		// protocol that a playlist names, and a playlist is attacker-shaped
+		// content: an HLS/DASH manifest fetched from a permitted origin can
+		// point a segment at `file:`, `concat:` or `subfile:` and have the
+		// demuxer read local files on its behalf — the console's own SD card,
+		// including other apps' data, all below the runtime's path sandbox
+		// because none of it goes through `Switch.readFile`.
+		//
+		// Restricting to the network transports the HLS/DASH path actually
+		// needs turns that into "Protocol not found". `crypto` is required for
+		// AES-128 encrypted HLS segments; `hls`/`dash`/`http`/`https`/`tcp`/
+		// `tls` are the demuxers and transports themselves.
+		//
+		// NOT closed by this: a permitted origin can still 30x the decoder to
+		// another HOST. libavformat follows redirects inside http.c with no
+		// AVOption to veto them (this build exposes neither `follow_redirects`
+		// nor `max_redirects`), so a per-host check would need an FFmpeg patch.
+		// The whitelist at least keeps a redirect on http/https.
+		av_dict_set(&net_opts, "protocol_whitelist",
+		            "http,https,tcp,tls,crypto,hls,dash", 0);
 		ret = avformat_open_input(&m->fmt, path, NULL, &net_opts);
 		av_dict_free(&net_opts);
 		if (ret < 0) {
