@@ -771,6 +771,763 @@ inline void touch_fbo() {
 }
 
 // ---------------------------------------------------------------------------
+// Draw probe (2026-09-12). Answers the ONE question a "clear works but nothing
+// is drawn" symptom raises: is the app issuing draws at all, and if so is the
+// GL state at the draw sane and pointed at this tenant?
+//
+// Dumps the first few draws per context plus a periodic heartbeat, so an app
+// that draws 60x/frame costs a handful of lines, not a flood. A draw that
+// never logs at all is the most informative result of the lot.
+//
+// Enabled by default while the PIXI bring-up is in flight; flip DRAW_PROBE_ON
+// to false (or delete) once WebGL2 app rendering is settled.
+static const bool DRAW_PROBE_ON = false;
+static uint64_t s_draw_probe_n = 0;
+static const unsigned kDrawProbeTenants = 16;
+static unsigned s_draw_probe_tenant_n[kDrawProbeTenants] = {0};
+static uint64_t s_clear_probe_n = 0;
+
+// Program probe (2026-09-12). `[fbo-peek]` pinned the white to a single draw:
+// tenant 3 clears fbo=12 to 0,0,0,255 and ONE drawElements (prog=47, 132
+// indices) leaves the whole target 255,255,255,255 with err=0x0. Clear, FBO,
+// compose and routing are all exonerated, so what is left is the program that
+// draw ran with. Three things can make a batch shader emit solid white and none
+// of them raise a GL error:
+//   - the program never linked (a draw with a non-linked program is undefined,
+//     and white is a common driver fallback),
+//   - its sampler array was never populated, so every fetch lands on texture
+//     unit 0 - where PIXI parks its 1x1 WHITE default texture,
+//   - the generated GLSL fell through its texture-id branch chain to a
+//     `vec4(1.0)` default.
+// So report link + validate status, what each sampler uniform actually points
+// at, and the fragment source itself. All read-only queries: nothing here binds
+// a texture or changes a unit, because a diagnostic that perturbs the frame it
+// is measuring is worse than none.
+static GLuint s_prog_seen[4] = {0, 0, 0, 0};
+static unsigned s_prog_seen_n = 0;
+static void program_probe(GLuint prog) {
+	if (!DRAW_PROBE_ON || prog == 0) return;
+	// Page contexts only - the shell's own programs render fine and would just
+	// spend the budget.
+	if (!st || st->tenant_id == 0) return;
+	for (unsigned i = 0; i < s_prog_seen_n; i++) {
+		if (s_prog_seen[i] == prog) return;
+	}
+	if (s_prog_seen_n >= 4) return;
+	const bool first = (s_prog_seen_n == 0);
+	s_prog_seen[s_prog_seen_n++] = prog;
+
+	GLint linked = 0, validated = 0, n_uniforms = 0;
+	glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+	glValidateProgram(prog);
+	glGetProgramiv(prog, GL_VALIDATE_STATUS, &validated);
+	glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &n_uniforms);
+	char log[512];
+	log[0] = 0;
+	GLsizei log_n = 0;
+	glGetProgramInfoLog(prog, (GLsizei)sizeof(log) - 1, &log_n, log);
+	log[log_n < (GLsizei)sizeof(log) ? log_n : (GLsizei)sizeof(log) - 1] = 0;
+	fprintf(stderr,
+	        "[prog-probe] prog=%u tenant=%u linked=%d validated=%d uniforms=%d log=%s\n",
+	        prog, st->tenant_id, (int)linked, (int)validated, (int)n_uniforms,
+	        log[0] ? log : "(empty)");
+
+	// Where does each sampler actually point? `uTextures[0..N] = 0,1,2,...` is
+	// what a multi-texture batch needs; every sampler reading 0 means every
+	// fetch hits unit 0.
+	char samp[384];
+	int so = 0;
+	samp[0] = 0;
+	for (GLint i = 0; i < n_uniforms && so < 320; i++) {
+		char name[96];
+		GLsizei name_n = 0;
+		GLint size = 0;
+		GLenum type = 0;
+		glGetActiveUniform(prog, (GLuint)i, (GLsizei)sizeof(name) - 1, &name_n,
+		                   &size, &type, name);
+		name[name_n < (GLsizei)sizeof(name) ? name_n : (GLsizei)sizeof(name) - 1] = 0;
+		if (type != GL_SAMPLER_2D && type != GL_SAMPLER_CUBE) continue;
+		const GLint loc = glGetUniformLocation(prog, name);
+		GLint unit = -1;
+		if (loc >= 0) glGetUniformiv(prog, loc, &unit);
+		so += snprintf(samp + so, sizeof(samp) - (size_t)so, " %s[%d]=%d", name,
+		               (int)size, (int)unit);
+	}
+	fprintf(stderr, "[prog-probe]   samplers:%s\n", samp[0] ? samp : " (none)");
+	// Sampler array + texture-unit census (2026-09-12). The batch shader is
+	// linked, validated and structurally correct, so the white has to be what
+	// it SAMPLES. Sampling an incomplete texture returns (0,0,0,1) black per
+	// the ES spec - never white - so 1,1,1,1 out of every draw means the fetch
+	// is landing on a genuinely white texture, and PIXI keeps exactly one:
+	// its 1x1 default (uploaded as `[tex-probe] #2 ... 1x1`). Two ways that
+	// happens: the sampler array never got its 0,1,2,... values so every fetch
+	// reads unit 0, or the real textures are not on the units PIXI thinks.
+	// Both are answered by reading the sampler elements and the per-unit
+	// bindings at the moment of the draw.
+	//
+	// The per-unit read needs glActiveTexture, which is exactly the probe that
+	// perturbed rendering last time (backgrounds vanished). So: save the active
+	// unit, restore it before returning, and run the census ONCE per tenant.
+	{
+		char su[256];
+		int suo = 0;
+		su[0] = 0;
+		for (int i = 0; i < 8 && suo < 200; i++) {
+			char nm[32];
+			snprintf(nm, sizeof(nm), "uTextures[%d]", i);
+			const GLint l = glGetUniformLocation(prog, nm);
+			GLint u = -1;
+			if (l >= 0) glGetUniformiv(prog, l, &u);
+			suo += snprintf(su + suo, sizeof(su) - (size_t)suo, " [%d]=%d", i,
+			                (int)u);
+		}
+		if (su[0]) {
+			fprintf(stderr, "[prog-probe]   uTextures elements:%s\n", su);
+		}
+
+		GLint prev_unit = GL_TEXTURE0;
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_unit);
+		char tu[320];
+		int tuo = 0;
+		tu[0] = 0;
+		for (int i = 0; i < 12 && tuo < 270; i++) {
+			glActiveTexture((GLenum)(GL_TEXTURE0 + i));
+			GLint bound = 0;
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+			tuo += snprintf(tu + tuo, sizeof(tu) - (size_t)tuo, " u%d=%d", i,
+			                (int)bound);
+		}
+		glActiveTexture((GLenum)prev_unit);
+		fprintf(stderr, "[prog-probe]   units (active=%d):%s\n",
+		        (int)(prev_unit - GL_TEXTURE0), tu);
+	}
+	// Per-unit texture COMPLETENESS (2026-09-12). Everything upstream now
+	// measures correct: the vertex data arrives with texId=0, uv 0..1 and an
+	// untinted 255,255,255,255, byte-identical on upload and on readback; the
+	// sampler array is 0,1,2,...; unit 0 holds the background texture. So the
+	// shader takes its first branch and fetches uTextures[0] - and still emits
+	// solid white.
+	//
+	// That leaves texture COMPLETENESS. A texture whose MIN_FILTER asks for
+	// mipmaps it does not have is incomplete, and sampling an incomplete
+	// texture is UNDEFINED in desktop GL - drivers commonly hand back opaque
+	// WHITE. Citron and Tegra/Mesa are both desktop-GL stacks, which is exactly
+	// why hardware reproduced the emulator's result byte for byte.
+	//
+	// 0x2600 NEAREST, 0x2601 LINEAR, 0x2700 NEAREST_MIPMAP_NEAREST,
+	// 0x2701 LINEAR_MIPMAP_NEAREST, 0x2702 NEAREST_MIPMAP_LINEAR,
+	// 0x2703 LINEAR_MIPMAP_LINEAR. Anything in the 0x270x range on a texture
+	// uploaded with a single texImage2D level is the bug.
+	{
+		GLint prev_unit2 = GL_TEXTURE0;
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_unit2);
+		for (int i = 0; i < 3; i++) {
+			glActiveTexture((GLenum)(GL_TEXTURE0 + i));
+			GLint bound = 0, minf = 0, magf = 0, ws = 0, wt = 0, base = 0, maxl = 0;
+			GLint samp_obj = 0;
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+			glGetIntegerv(GL_SAMPLER_BINDING, &samp_obj);
+			if (bound) {
+				glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &minf);
+				glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &magf);
+				glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &ws);
+				glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, &wt);
+				glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, &base);
+				glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &maxl);
+			}
+			fprintf(stderr,
+			        "[prog-probe]   unit%d tex=%d min=0x%x mag=0x%x wrap=0x%x,0x%x "
+			        "baseLevel=%d maxLevel=%d sampler=%d\n",
+			        i, (int)bound, (unsigned)minf, (unsigned)magf, (unsigned)ws,
+			        (unsigned)wt, (int)base, (int)maxl, (int)samp_obj);
+		}
+		glActiveTexture((GLenum)prev_unit2);
+	}
+	// Uniform-block census (2026-09-12). Every input to this draw now measures
+	// correct - program, sampler array, unit bindings, texture completeness,
+	// attribute pointers, and the vertex data itself (texId=0, uv 0..1,
+	// untinted white, byte-identical on upload and readback). The one thing
+	// never looked at is the UBO: PIXI v8 drives uProjectionMatrix,
+	// uWorldTransformMatrix and uWorldColorAlpha through a `globalUniforms`
+	// uniform block, and a garbage block explains this symptom exactly - a
+	// wrong matrix stretches the quad over the whole target, and a
+	// uWorldColorAlpha above 1 saturates vColor to white, which is the uniform
+	// 1,1,1,1 we keep reading. Mesa/Nouveau also has documented UBO trouble,
+	// and our own bridge has never had this path measured.
+	//
+	// Prints each active block (name, binding, size), the buffer actually bound
+	// to that binding point, and the first floats of its contents. A sane
+	// orthographic projection for a 1280x720 target shows recognisable values
+	// (~0.0016, ~-0.0028, -1, 1); zeros or wild numbers name the bug.
+	{
+		GLint n_blocks = 0;
+	// Uniform VALUES + texture CONTENT (2026-09-12). The full vertex shader is
+	// now in hand:
+	//     gl_Position = vec4((uProjectionMatrix * uWorldTransformMatrix
+	//                         * modelMatrix * vec3(aPosition,1.0)).xy, 0, 1);
+	//     vColor = vec4(1.) * vec4(aColor.rgb*aColor.a, aColor.a) * uWorldColorAlpha;
+	//     vTextureId = aTextureIdAndRound.y;
+	// and `uniform blocks=0` - these are PLAIN uniforms, not a UBO. (Also note
+	// the packing: .y is the texture id, .x is the round flag; the vbo-probe's
+	// two fields were labelled the wrong way round, though both read 0 so the
+	// conclusion - texture id 0, first branch - is unchanged.)
+	//
+	// So exactly two inputs remain unmeasured: the values of those uniforms,
+	// and whether the texture still holds the image we uploaded. Everything
+	// else in this draw has been measured correct.
+	{
+		static const char *names[] = {"uProjectionMatrix", "uWorldTransformMatrix",
+		                              "uWorldColorAlpha", "uResolution"};
+		static const int counts[] = {9, 9, 4, 2};
+		for (int u = 0; u < 4; u++) {
+			const GLint loc = glGetUniformLocation(prog, names[u]);
+			if (loc < 0) {
+				fprintf(stderr, "[prog-probe]   uniform %s ABSENT\n", names[u]);
+				continue;
+			}
+			GLfloat v[9] = {0};
+			glGetUniformfv(prog, loc, v);
+			char out[200];
+			int o = 0;
+			out[0] = 0;
+			for (int i = 0; i < counts[u] && o < 170; i++) {
+				o += snprintf(out + o, sizeof(out) - (size_t)o, " %.5f", v[i]);
+			}
+			fprintf(stderr, "[prog-probe]   uniform %s =%s\n", names[u], out);
+		}
+
+		// What does the sampled texture actually CONTAIN right now? Uploaded
+		// bytes were correct (`[tex-probe] texel(0,0)=16,131,176,255` for the
+		// background), but nothing has ever confirmed they survive to draw
+		// time - a texture wiped after upload samples as whatever replaced it.
+		// Attach it to a scratch read-FBO and sample; the FBO is deleted and
+		// the previous read binding restored immediately.
+		GLint prev_unit3 = GL_TEXTURE0, prev_read3 = 0;
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_unit3);
+		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read3);
+		glActiveTexture(GL_TEXTURE0);
+		GLint tex0 = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
+		if (tex0) {
+			GLuint tmp = 0;
+			glGenFramebuffers(1, &tmp);
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, tmp);
+			glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+			                       GL_TEXTURE_2D, (GLuint)tex0, 0);
+			const GLenum st_ = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+			if (st_ == GL_FRAMEBUFFER_COMPLETE) {
+				unsigned char a[4] = {0}, b[4] = {0};
+				glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, a);
+				glReadPixels(64, 64, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, b);
+				fprintf(stderr,
+				        "[prog-probe]   tex%d content (0,0)=%u,%u,%u,%u (64,64)=%u,%u,%u,%u err=0x%x\n",
+				        (int)tex0, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3],
+				        (unsigned)glGetError());
+			} else {
+				fprintf(stderr, "[prog-probe]   tex%d content UNREADABLE status=0x%x\n",
+				        (int)tex0, (unsigned)st_);
+			}
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read3);
+			glDeleteFramebuffers(1, &tmp);
+		}
+		glActiveTexture((GLenum)prev_unit3);
+	}
+		glGetProgramiv(prog, GL_ACTIVE_UNIFORM_BLOCKS, &n_blocks);
+		fprintf(stderr, "[prog-probe]   uniform blocks=%d\n", (int)n_blocks);
+		for (GLint b = 0; b < n_blocks && b < 4; b++) {
+			char bn[64];
+			GLsizei bn_n = 0;
+			glGetActiveUniformBlockName(prog, (GLuint)b, (GLsizei)sizeof(bn) - 1,
+			                            &bn_n, bn);
+			bn[bn_n < (GLsizei)sizeof(bn) ? bn_n : (GLsizei)sizeof(bn) - 1] = 0;
+			GLint binding = 0, data_size = 0;
+			glGetActiveUniformBlockiv(prog, (GLuint)b, GL_UNIFORM_BLOCK_BINDING,
+			                          &binding);
+			glGetActiveUniformBlockiv(prog, (GLuint)b, GL_UNIFORM_BLOCK_DATA_SIZE,
+			                          &data_size);
+			GLint bound_buf = 0, buf_off = 0, buf_size = 0;
+			glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, (GLuint)binding, &bound_buf);
+			glGetIntegeri_v(GL_UNIFORM_BUFFER_START, (GLuint)binding, &buf_off);
+			glGetIntegeri_v(GL_UNIFORM_BUFFER_SIZE, (GLuint)binding, &buf_size);
+			fprintf(stderr,
+			        "[prog-probe]   block '%s' binding=%d dataSize=%d -> buffer=%d off=%d size=%d\n",
+			        bn, (int)binding, (int)data_size, (int)bound_buf, (int)buf_off,
+			        (int)buf_size);
+			if (!bound_buf) continue;
+			GLint prev_ub = 0;
+			glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &prev_ub);
+			glBindBuffer(GL_UNIFORM_BUFFER, (GLuint)bound_buf);
+			const GLsizeiptr span = data_size > 96 ? 96 : (data_size > 0 ? data_size : 96);
+			const void *m = glMapBufferRange(GL_UNIFORM_BUFFER, buf_off, span,
+			                                 GL_MAP_READ_BIT);
+			if (m) {
+				char fv[320];
+				int fo = 0;
+				fv[0] = 0;
+				const int n_floats = (int)(span / 4) > 24 ? 24 : (int)(span / 4);
+				for (int i = 0; i < n_floats && fo < 280; i++) {
+					float f;
+					memcpy(&f, (const uint8_t *)m + i * 4, 4);
+					fo += snprintf(fv + fo, sizeof(fv) - (size_t)fo, " %.4f", f);
+				}
+				glUnmapBuffer(GL_UNIFORM_BUFFER);
+				fprintf(stderr, "[prog-probe]     floats:%s\n", fv);
+			} else {
+				fprintf(stderr, "[prog-probe]     MAP FAILED err=0x%x\n",
+				        (unsigned)glGetError());
+			}
+			glBindBuffer(GL_UNIFORM_BUFFER, (GLuint)prev_ub);
+		}
+	}
+	// Attribute census (2026-09-12). Sampler array and unit bindings both came
+	// back CORRECT (`uTextures [i]=i`, units 0..6 holding the real textures,
+	// 7+ holding PIXI's white 1x1 filler), so the batch is sampling a FILLER
+	// slot - i.e. `vTextureId` is wrong, not the textures.
+	//
+	// vTextureId rides in `aTextureIdAndRound`, and PIXI chooses how to upload
+	// each attribute from the type OUR getActiveAttrib reports for it:
+	//     shaderAttr.format.substring(1,4) === 'int'
+	//         ? gl.vertexAttribIPointer(...)   // integer attribute
+	//         : gl.vertexAttribPointer(...)    // float attribute
+	// Its batch shader is GLSL ES 1.00, where every attribute is a FLOAT, so
+	// the float path is the only correct one - and feeding a float attribute
+	// through vertexAttribIPointer yields undefined values, which is exactly
+	// how vTextureId would end up out of range.
+	//
+	// So print both halves: what the program says each attribute IS, and how
+	// each one was actually pointed. GL_VERTEX_ATTRIB_ARRAY_INTEGER is the
+	// flag that settles which of the two calls PIXI made.
+	{
+		GLint n_attrs = 0;
+		glGetProgramiv(prog, GL_ACTIVE_ATTRIBUTES, &n_attrs);
+		for (GLint i = 0; i < n_attrs && i < 8; i++) {
+			char nm[64];
+			GLsizei nm_n = 0;
+			GLint a_size = 0;
+			GLenum a_type = 0;
+			glGetActiveAttrib(prog, (GLuint)i, (GLsizei)sizeof(nm) - 1, &nm_n,
+			                  &a_size, &a_type, nm);
+			nm[nm_n < (GLsizei)sizeof(nm) ? nm_n : (GLsizei)sizeof(nm) - 1] = 0;
+			const GLint loc = glGetAttribLocation(prog, nm);
+			GLint en = 0, sz = 0, ty = 0, norm = 0, stride = 0, integer = 0, buf = 0;
+			void *ptr = nullptr;
+			if (loc >= 0) {
+				glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en);
+				glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_SIZE, &sz);
+				glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty);
+				glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &norm);
+				glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+				glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_INTEGER, &integer);
+				glGetVertexAttribiv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
+				glGetVertexAttribPointerv((GLuint)loc, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr);
+			}
+			fprintf(stderr,
+			        "[prog-probe]   attr %s loc=%d shaderType=0x%x size=%d | on=%d "
+			        "size=%d type=0x%x norm=%d stride=%d INTEGER=%d buf=%d off=%d\n",
+			        nm, (int)loc, (unsigned)a_type, (int)a_size, (int)en, (int)sz,
+			        (unsigned)ty, (int)norm, (int)stride, (int)integer, (int)buf,
+			        (int)(intptr_t)ptr);
+		}
+	}
+
+	// The fragment source, once, for the first page program only - enough to
+	// read the texture-id branch chain and its fallback.
+	if (first) {
+		GLuint shaders[4] = {0, 0, 0, 0};
+		GLsizei n_shaders = 0;
+		glGetAttachedShaders(prog, 4, &n_shaders, shaders);
+		for (GLsizei i = 0; i < n_shaders; i++) {
+			GLint kind = 0;
+			glGetShaderiv(shaders[i], GL_SHADER_TYPE, &kind);
+			if (kind != GL_FRAGMENT_SHADER && kind != GL_VERTEX_SHADER) continue;
+			GLint compiled = 0;
+			glGetShaderiv(shaders[i], GL_COMPILE_STATUS, &compiled);
+			static char src[8192];
+			GLsizei src_n = 0;
+			glGetShaderSource(shaders[i], (GLsizei)sizeof(src) - 1, &src_n, src);
+			src[src_n < (GLsizei)sizeof(src) ? src_n : (GLsizei)sizeof(src) - 1] = 0;
+			fprintf(stderr, "[prog-probe]   fragment compiled=%d src<<<\n%s\n>>>\n",
+			        (int)compiled, src);
+		}
+	}
+	fflush(stderr);
+}
+
+// Vertex-data probe (2026-09-12). Program, samplers, unit bindings and every
+// attribute pointer have now all come back CORRECT, and the batch shader's
+// generated GLSL declares `vec4 outColor;` UNINITIALISED above its
+// `if(vTextureId < 0.5) ... else if ...` chain - so if vTextureId falls outside
+// every branch, outColor is never assigned and the fragment emits whatever the
+// register held. Solid 1,1,1,1 is exactly what that looks like.
+//
+// vTextureId rides in bytes 20..23 of each 24-byte vertex (uint16 x2, offset
+// 20), uploaded by PIXI's batcher through the WebGL2 5-arg bufferSubData. That
+// is the one thing in this path never yet measured - and it is the open
+// question the spineboy session ended on. So dump BOTH ends: the bytes PIXI
+// hands us, and the bytes actually sitting in the buffer at draw time. They
+// agree -> the data is PIXI's own and the fault is above the engine; they
+// differ -> the upload mangled it.
+static unsigned s_vbo_probe_n = 0;
+static void vbo_upload_probe(GLenum target, GLintptr offset, const uint8_t *p,
+                             size_t len) {
+	if (!DRAW_PROBE_ON || !p) return;
+	if (!st || st->tenant_id == 0) return;
+	if (target != GL_ARRAY_BUFFER || s_vbo_probe_n >= 6) return;
+	s_vbo_probe_n++;
+	GLint buf = 0;
+	glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &buf);
+	// First two vertices of the uploaded slice, in PIXI's batch layout.
+	char out[320];
+	int o = 0;
+	out[0] = 0;
+	for (int v = 0; v < 2 && (size_t)((v + 1) * 24) <= len && o < 260; v++) {
+		const uint8_t *q = p + v * 24;
+		float px, py, u, uv;
+		memcpy(&px, q + 0, 4);
+		memcpy(&py, q + 4, 4);
+		memcpy(&u, q + 8, 4);
+		memcpy(&uv, q + 12, 4);
+		uint16_t tid = 0, rnd = 0;
+		memcpy(&tid, q + 20, 2);
+		memcpy(&rnd, q + 22, 2);
+		o += snprintf(out + o, sizeof(out) - (size_t)o,
+		              " v%d[pos=%.1f,%.1f uv=%.3f,%.3f rgba=%u,%u,%u,%u texId=%u round=%u]",
+		              v, px, py, u, uv, q[16], q[17], q[18], q[19],
+		              (unsigned)tid, (unsigned)rnd);
+	}
+	fprintf(stderr,
+	        "[vbo-probe] upload buf=%d offset=%d len=%u tenant=%u%s\n",
+	        (int)buf, (int)offset, (unsigned)len, st->tenant_id,
+	        out[0] ? out : " (slice shorter than one vertex)");
+	fflush(stderr);
+}
+
+// Read back what is actually IN the bound ARRAY_BUFFER at draw time. Mapped
+// read-only and unmapped immediately, before the draw this probe precedes is
+// dispatched, so the buffer is never mapped while in use.
+static unsigned s_vbo_read_n[kDrawProbeTenants] = {0};
+static void vbo_readback_probe(void) {
+	if (!DRAW_PROBE_ON) return;
+	const unsigned tid = st ? st->tenant_id : 0;
+	if (tid == 0 || tid >= kDrawProbeTenants || s_vbo_read_n[tid] >= 2) return;
+	s_vbo_read_n[tid]++;
+	GLint buf = 0;
+	glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &buf);
+	if (!buf) return;
+	const GLsizeiptr span = 48; // two 24-byte vertices
+	const void *m = glMapBufferRange(GL_ARRAY_BUFFER, 0, span, GL_MAP_READ_BIT);
+	if (!m) {
+		fprintf(stderr, "[vbo-probe] readback buf=%d MAP FAILED err=0x%x\n",
+		        (int)buf, (unsigned)glGetError());
+		fflush(stderr);
+		return;
+	}
+	char out[320];
+	int o = 0;
+	out[0] = 0;
+	for (int v = 0; v < 2 && o < 260; v++) {
+		const uint8_t *q = (const uint8_t *)m + v * 24;
+		float px, py, u, uv;
+		memcpy(&px, q + 0, 4);
+		memcpy(&py, q + 4, 4);
+		memcpy(&u, q + 8, 4);
+		memcpy(&uv, q + 12, 4);
+		uint16_t t = 0, rnd = 0;
+		memcpy(&t, q + 20, 2);
+		memcpy(&rnd, q + 22, 2);
+		o += snprintf(out + o, sizeof(out) - (size_t)o,
+		              " v%d[pos=%.1f,%.1f uv=%.3f,%.3f rgba=%u,%u,%u,%u texId=%u round=%u]",
+		              v, px, py, u, uv, q[16], q[17], q[18], q[19],
+		              (unsigned)t, (unsigned)rnd);
+	}
+	glUnmapBuffer(GL_ARRAY_BUFFER);
+	fprintf(stderr, "[vbo-probe] readback buf=%d tenant=%u%s\n", (int)buf, tid,
+	        out);
+	fflush(stderr);
+}
+
+static void draw_probe(const char *what, GLenum mode, int count) {
+	if (!DRAW_PROBE_ON) return;
+	s_draw_probe_n++;
+	// Full dump for the first 4 draws OF EACH TENANT, then one terse line
+	// every 600 draws overall. Per-tenant matters: the shell draws its own
+	// chrome on tenant 0 long before the app starts, so a global "first 6"
+	// gate spends every full dump on the shell and never shows the app's
+	// opening draws - which are the ones worth seeing.
+	unsigned tid = st ? st->tenant_id : 0;
+	bool full = false;
+	if (tid < kDrawProbeTenants && s_draw_probe_tenant_n[tid] < 4) {
+		s_draw_probe_tenant_n[tid]++;
+		full = true;
+	}
+	if (!full && (s_draw_probe_n % 600) != 0) return;
+
+	GLint fbo = 0, prog = 0, vao = 0, ab = 0, eab = 0, tex = 0;
+	GLint vp[4] = {0, 0, 0, 0};
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+	glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+	glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+	glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &ab);
+	glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &eab);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+	glGetIntegerv(GL_VIEWPORT, vp);
+
+	if (!full) {
+		fprintf(stderr, "[draw-probe] #%llu %s mode=0x%x count=%d fbo=%d prog=%d\n",
+		        (unsigned long long)s_draw_probe_n, what, (unsigned)mode, count,
+		        (int)fbo, (int)prog);
+		fflush(stderr);
+		return;
+	}
+
+	// Expected target: this context tenant FBO when drawing to the "canvas",
+	// or whatever the app bound itself when rendering to a texture. A draw
+	// landing on fbo=0 while draw_into_default is true means it is going to
+	// the real default framebuffer and will never be composed.
+	program_probe((GLuint)prog);
+	vbo_readback_probe();
+	unsigned tenant = st ? st->tenant_id : 0;
+	int into_default = st ? (st->draw_into_default ? 1 : 0) : -1;
+	GLint a0_on = 0, a0_size = 0, a0_stride = 0, a0_buf = 0;
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &a0_on);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &a0_size);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &a0_stride);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &a0_buf);
+	GLboolean cmask[4] = {0, 0, 0, 0};
+	glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
+	GLint sc[4] = {0, 0, 0, 0};
+	glGetIntegerv(GL_SCISSOR_BOX, sc);
+	GLint bsrc_rgb = 0, bsrc_a = 0, bdst_rgb = 0, bdst_a = 0;
+	GLint beq_rgb = 0, beq_a = 0;
+	glGetIntegerv(GL_BLEND_SRC_RGB, &bsrc_rgb);
+	glGetIntegerv(GL_BLEND_SRC_ALPHA, &bsrc_a);
+	glGetIntegerv(GL_BLEND_DST_RGB, &bdst_rgb);
+	glGetIntegerv(GL_BLEND_DST_ALPHA, &bdst_a);
+	glGetIntegerv(GL_BLEND_EQUATION_RGB, &beq_rgb);
+	glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &beq_a);
+
+	fprintf(stderr,
+	        "[draw-probe] #%llu %s mode=0x%x count=%d tenant=%u into_default=%d\n"
+	        "[draw-probe]   fbo=%d prog=%d vao=%d arraybuf=%d elembuf=%d tex2d=%d\n"
+	        "[draw-probe]   viewport=%d,%d,%dx%d scissor=%d,%d,%dx%d scissor_on=%d\n"
+	        "[draw-probe]   blend=%d depth=%d cull=%d colormask=%d%d%d%d\n"
+	        "[draw-probe]   blendfunc src=0x%x,0x%x dst=0x%x,0x%x eq=0x%x,0x%x\n"
+	        "[draw-probe]   attrib0 on=%d size=%d stride=%d buf=%d\n",
+	        (unsigned long long)s_draw_probe_n, what, (unsigned)mode, count,
+	        tenant, into_default,
+	        (int)fbo, (int)prog, (int)vao, (int)ab, (int)eab, (int)tex,
+	        vp[0], vp[1], vp[2], vp[3], sc[0], sc[1], sc[2], sc[3],
+	        glIsEnabled(GL_SCISSOR_TEST) ? 1 : 0,
+	        glIsEnabled(GL_BLEND) ? 1 : 0, glIsEnabled(GL_DEPTH_TEST) ? 1 : 0,
+	        glIsEnabled(GL_CULL_FACE) ? 1 : 0,
+	        cmask[0] ? 1 : 0, cmask[1] ? 1 : 0, cmask[2] ? 1 : 0, cmask[3] ? 1 : 0,
+	        (unsigned)bsrc_rgb, (unsigned)bsrc_a, (unsigned)bdst_rgb,
+	        (unsigned)bdst_a, (unsigned)beq_rgb, (unsigned)beq_a,
+	        (int)a0_on, (int)a0_size, (int)a0_stride, (int)a0_buf);
+	fflush(stderr);
+}
+
+// Report any GL error the draw itself raised. Cheap: only while the probe is
+// dumping in full, since glGetError is a pipeline sync point.
+static void fbo_peek(const char *tag);
+static void draw_probe_after(const char *what) {
+	if (!DRAW_PROBE_ON) return;
+	GLenum e = glGetError();
+	fbo_peek("post-draw");
+	if (s_draw_probe_n > 6) return;
+	if (e != GL_NO_ERROR) {
+		fprintf(stderr, "[draw-probe]   %s -> GL ERROR 0x%x\n", what, (unsigned)e);
+		fflush(stderr);
+	}
+}
+
+// FBO peek (2026-09-12). Every render target tenant 3 owns - PIXI's back
+// buffer, its filter target AND the tenant default - reads pure white at
+// compose time, while the shell's tenant 0 reads real scene colour through the
+// same code path, and the tenant FBOs are now demonstrably cleared to
+// transparent at creation (`[bridge-fbo:cleared]`). So something in the app's
+// own draw stream writes white. This narrows WHICH operation does it by
+// sampling the bound draw framebuffer immediately after a clear and
+// immediately after a draw:
+//   post-clear white   -> the clear path is producing white (state/driver),
+//                         and every draw then blends onto white;
+//   post-clear black, post-draw white -> the DRAW writes white, i.e. the
+//                         fragment shader's texture sample or colour is wrong.
+// Reads through GL_READ_FRAMEBUFFER with the read + pack bindings restored, so
+// the app's draw state is untouched.
+static unsigned s_peek_n[kDrawProbeTenants] = {0};
+static void fbo_peek(const char *tag) {
+	if (!DRAW_PROBE_ON) return;
+	const unsigned tid = st ? st->tenant_id : 0;
+	if (tid >= kDrawProbeTenants) return;
+	// First 8 unconditionally (startup), then only on a CHANGE - the point is to
+	// name the draw that turns a correct target white, not to dump every draw.
+	const bool early = s_peek_n[tid] < 8;
+	s_peek_n[tid]++;
+
+	GLint draw_fbo = 0, prev_read = 0, prev_pack = 0, vp[4] = {0, 0, 0, 0};
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &draw_fbo);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pack);
+	glGetIntegerv(GL_VIEWPORT, vp);
+	if (prev_pack) glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)draw_fbo);
+
+	unsigned char c[4] = {0}, q[4] = {0};
+	const int cx = vp[2] > 2 ? vp[0] + vp[2] / 2 : 0;
+	const int cy = vp[3] > 2 ? vp[1] + vp[3] / 2 : 0;
+	glReadPixels(cx, cy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, c);
+	glReadPixels(cx / 2, cy / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, q);
+	const GLenum err = glGetError();
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+	if (prev_pack) glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pack);
+
+	static unsigned char last[kDrawProbeTenants][4] = {{0}};
+	const int d0 = (int)c[0] - (int)last[tid][0];
+	const int d1 = (int)c[1] - (int)last[tid][1];
+	const int d2 = (int)c[2] - (int)last[tid][2];
+	const bool changed = (d0 > 24 || d0 < -24) || (d1 > 24 || d1 < -24) || (d2 > 24 || d2 < -24);
+	const bool white = c[0] > 250 && c[1] > 250 && c[2] > 250;
+	last[tid][0] = c[0]; last[tid][1] = c[1]; last[tid][2] = c[2]; last[tid][3] = c[3];
+	if (!early && !changed) return;
+	GLint cur_prog = 0, cur_tex = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &cur_prog);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &cur_tex);
+	fprintf(stderr,
+	        "[fbo-peek] %s%s draw#%llu tenant=%u fbo=%d prog=%d tex=%d centre=%u,%u,%u,%u quarter=%u,%u,%u,%u err=0x%x\n",
+	        tag, (changed && white) ? " WHITENED" : "",
+	        (unsigned long long)s_draw_probe_n, tid, (int)draw_fbo, (int)cur_prog,
+	        (int)cur_tex, c[0], c[1], c[2], c[3], q[0], q[1], q[2], q[3],
+	        (unsigned)err);
+	fflush(stderr);
+}
+
+// Texture-upload probe (2026-09-12). For the "renders, but the colours are
+// wrong until some later state change fixes them" symptom. Everything that can
+// skew colour on this path is decided HERE and is otherwise invisible:
+// the caller's (internalformat, format, type), whether the source was a typed
+// array or an nx_image_t (our images are PREMULTIPLIED BGRA, converted through
+// convert_image_source_to_gl_pixels), and the WebGL unpack state
+// (UNPACK_FLIP_Y / UNPACK_PREMULTIPLY_ALPHA / alignment).
+//
+// Logs the first 24 uploads. A texture atlas is uploaded once, so the
+// interesting ones are all at the start; per-frame dynamic textures would
+// otherwise flood.
+static uint64_t s_tex_probe_n = 0;
+
+// Render-target / blend census (2026-09-12). For the "a sprite draws its whole
+// quad as an opaque box" symptom - i.e. alpha is being lost somewhere between
+// the texture and the composited frame.
+//
+// The draw probe only samples, so it can miss an off-screen pass entirely.
+// This instead reports each render target the FIRST time it is drawn into,
+// which is exactly what reveals whether the app uses intermediate render
+// textures (PIXI filters / bloom do; a plain sprite pass does not). An
+// intermediate target whose colour attachment has no alpha, or whose clear
+// leaves alpha at 1, composites back as a visible rectangle - the artifact.
+static const unsigned kRtCensusMax = 12;
+static GLint s_rt_seen[kRtCensusMax] = {-1, -1, -1, -1, -1, -1,
+                                        -1, -1, -1, -1, -1, -1};
+static unsigned s_rt_seen_n = 0;
+
+static void rt_census(void) {
+	if (!DRAW_PROBE_ON) return;
+	GLint fbo = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+	for (unsigned i = 0; i < s_rt_seen_n; i++) {
+		if (s_rt_seen[i] == fbo) return;
+	}
+	if (s_rt_seen_n >= kRtCensusMax) return;
+	s_rt_seen[s_rt_seen_n++] = fbo;
+
+	// Describe the colour attachment: an alpha-less internal format here is a
+	// direct explanation for a lost-transparency artifact.
+	GLint atype = 0, aname = 0;
+	GLint rs = -1, gs = -1, bs = -1, as_ = -1;
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &atype);
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &aname);
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_RED_SIZE, &rs);
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_GREEN_SIZE, &gs);
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_BLUE_SIZE, &bs);
+	glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+	    GL_FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE, &as_);
+	GLenum err = glGetError();  // the queries are illegal on fbo 0 on some drivers
+	if (err != GL_NO_ERROR) { rs = gs = bs = as_ = -1; }
+
+	fprintf(stderr,
+	        "[rt-census] NEW render target fbo=%d tenant=%u into_default=%d\n"
+	        "[rt-census]   color0 objtype=0x%x name=%d bits R%d G%d B%d A%d\n",
+	        (int)fbo, st ? st->tenant_id : 0,
+	        st ? (st->draw_into_default ? 1 : 0) : -1,
+	        (unsigned)atype, (int)aname, (int)rs, (int)gs, (int)bs, (int)as_);
+	fflush(stderr);
+}
+
+// Blend + clear-colour census. PIXI changes blend mode per batch; the portal
+// artifact hinges on which mode its quad actually lands on, and on whether the
+// clear leaves alpha at 0 or 1 in an intermediate target.
+static unsigned s_blend_probe_n = 0;
+static void blend_probe(const char *what, unsigned a, unsigned b,
+                        unsigned c, unsigned d) {
+	if (!DRAW_PROBE_ON || s_blend_probe_n >= 24) return;
+	s_blend_probe_n++;
+	GLint fbo = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+	fprintf(stderr, "[blend-probe] %s 0x%x 0x%x 0x%x 0x%x fbo=%d\n",
+	        what, a, b, c, d, (int)fbo);
+	fflush(stderr);
+}
+
+static void tex_probe(const char *what, GLenum target, GLint level,
+                      GLint internalformat, GLenum format, GLenum type,
+                      GLsizei w, GLsizei h, bool from_image,
+                      const void *pixels) {
+	if (!DRAW_PROBE_ON) return;
+	s_tex_probe_n++;
+	if (s_tex_probe_n > 24) return;
+	GLint bound = 0;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	fprintf(stderr,
+	        "[tex-probe] #%llu %s target=0x%x level=%d %dx%d tex=%d tenant=%u\n"
+	        "[tex-probe]   internalformat=0x%x format=0x%x type=0x%x src=%s\n"
+	        "[tex-probe]   flip_y=%d premultiply=%d unpack_align=%d\n",
+	        (unsigned long long)s_tex_probe_n, what, (unsigned)target, level,
+	        (int)w, (int)h, (int)bound, st ? st->tenant_id : 0,
+	        (unsigned)internalformat, (unsigned)format, (unsigned)type,
+	        from_image ? "nx_image(premul BGRA)" : "typed-array/null",
+	        st ? (st->unpack_flip_y ? 1 : 0) : -1,
+	        st ? (st->unpack_premultiply ? 1 : 0) : -1,
+	        st ? st->unpack_alignment : -1);
+	// Sample the ACTUAL bytes about to be handed to GL. This is the
+	// decisive test for "the sprite draws its whole quad as a box":
+	// a sprite atlas corner is fully transparent, so texel(0,0) MUST
+	// read a=0. Anything else means alpha was lost or forged before
+	// upload, and the quad can only render opaque.
+	// Also distinguishes premultiplied from straight storage: a
+	// premultiplied texel can never have a channel greater than its
+	// alpha, so any rgb > a proves the data is STRAIGHT.
+	if (pixels && format == GL_RGBA && type == GL_UNSIGNED_BYTE &&
+	    w > 1 && h > 1) {
+		const uint8_t *px = (const uint8_t *)pixels;
+		size_t mid = ((size_t)(h / 2) * (size_t)w + (size_t)(w / 2)) * 4;
+		size_t last = ((size_t)(h - 1) * (size_t)w + (size_t)(w - 1)) * 4;
+		fprintf(stderr,
+		        "[tex-probe]   texel(0,0)=%u,%u,%u,%u mid=%u,%u,%u,%u"
+		        " last=%u,%u,%u,%u\n",
+		        px[0], px[1], px[2], px[3],
+		        px[mid], px[mid + 1], px[mid + 2], px[mid + 3],
+		        px[last], px[last + 1], px[last + 2], px[last + 3]);
+	}
+	fflush(stderr);
+}
+
+// ---------------------------------------------------------------------------
 // Method implementations — the 2.C allowlist.
 // Order matches upstream's table for easy diffing. Methods that the slice
 // demo provably doesn't call are NOT here; calling them throws TypeError
@@ -859,6 +1616,7 @@ FN(w_depth_range) { enter_bracket(); glDepthRangef(a_f32(info, 0), a_f32(info, 1
 FN(w_cull_face) { enter_bracket(); glCullFace(a_u32(info, 0)); }
 FN(w_front_face) { enter_bracket(); glFrontFace(a_u32(info, 0)); }
 FN(w_blend_func) {
+	blend_probe("blendFunc", a_u32(info, 0), a_u32(info, 1), 0, 0);
 	enter_bracket();
 	const GLenum s = a_u32(info, 0), d = a_u32(info, 1);
 	glBlendFunc(s, d);
@@ -868,6 +1626,8 @@ FN(w_blend_func) {
 	}
 }
 FN(w_blend_func_separate) {
+	blend_probe("blendFuncSeparate", a_u32(info, 0), a_u32(info, 1),
+	            a_u32(info, 2), a_u32(info, 3));
 	enter_bracket();
 	const GLenum sRgb = a_u32(info, 0), dRgb = a_u32(info, 1);
 	const GLenum sA = a_u32(info, 2), dA = a_u32(info, 3);
@@ -879,7 +1639,11 @@ FN(w_blend_func_separate) {
 		st->user_snap.blend_dst_a   = dA;
 	}
 }
-FN(w_blend_equation) { enter_bracket(); glBlendEquation(a_u32(info, 0)); }
+FN(w_blend_equation) {
+	blend_probe("blendEquation", a_u32(info, 0), 0, 0, 0);
+	enter_bracket();
+	glBlendEquation(a_u32(info, 0));
+}
 FN(w_blend_equation_separate) {
 	enter_bracket();
 	glBlendEquationSeparate(a_u32(info, 0), a_u32(info, 1));
@@ -962,9 +1726,33 @@ FN(w_clear) {
 	enter_bracket();
 	if (!nx_fbo_complete_or_record_error()) return;
 	glClear(a_u32(info, 0));
+	fbo_peek("post-clear");
+	// Render-loop heartbeat. Pairs with draw_probe: an app whose clear
+	// count climbs while draws stay at 0 is running its frame loop and
+	// producing no geometry - a very different bug from one whose loop
+	// never ticks. Without this, "no draws" and "no frames" look alike
+	// in the log (both are silence).
+	if (DRAW_PROBE_ON) {
+		s_clear_probe_n++;
+		if (s_clear_probe_n <= 3 || (s_clear_probe_n % 300) == 0) {
+			GLint cf = 0;
+			glGetIntegerv(GL_FRAMEBUFFER_BINDING, &cf);
+			fprintf(stderr,
+			        "[clear-probe] clears=%llu draws=%llu tenant=%u fbo=%d\n",
+			        (unsigned long long)s_clear_probe_n,
+			        (unsigned long long)s_draw_probe_n,
+			        st ? st->tenant_id : 0, (int)cf);
+			fflush(stderr);
+		}
+	}
 	touch_fbo();
 }
 FN(w_clear_color) {
+	blend_probe("clearColor(x1000)",
+	            (unsigned)(a_f32(info, 0) * 1000),
+	            (unsigned)(a_f32(info, 1) * 1000),
+	            (unsigned)(a_f32(info, 2) * 1000),
+	            (unsigned)(a_f32(info, 3) * 1000));
 	enter_bracket();
 	const GLfloat r = a_f32(info, 0), g = a_f32(info, 1);
 	const GLfloat b = a_f32(info, 2), a = a_f32(info, 3);
@@ -982,6 +1770,14 @@ FN(w_finish) { enter_bracket(); glFinish(); }
 FN(w_flush) { enter_bracket(); glFlush(); }
 
 FN(w_pixel_storei) {
+	// Paired with tex_probe: PIXI/Spine set UNPACK_PREMULTIPLY_ALPHA_WEBGL
+	// and UNPACK_FLIP_Y_WEBGL around uploads, and whether we honour each is
+	// exactly what decides premultiplied-vs-straight colour. First 24 only.
+	if (DRAW_PROBE_ON && s_tex_probe_n <= 24) {
+		fprintf(stderr, "[tex-probe] pixelStorei pname=0x%x value=%d\n",
+		        (unsigned)a_u32(info, 0), (int)a_i32(info, 1));
+		fflush(stderr);
+	}
 	const GLenum pname = a_u32(info, 0);
 	const GLint val = a_i32(info, 1);
 	switch (pname) {
@@ -1181,6 +1977,25 @@ FN(w_get_parameter) {
 		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, n * 4);
 		memcpy(ab->Data(), v, n * 4);
 		info.GetReturnValue().Set(Float32Array::New(ab, 0, n));
+		return;
+	}
+	// WebGL spec: getParameter(VIEWPORT) and getParameter(SCISSOR_BOX) each
+	// return an Int32Array(4). Neither had a case here, so both fell through
+	// to the scalar default and returned the NUMBER 0 — `vp[0]` reads
+	// undefined, and any library that saves/restores the viewport the normal
+	// way (`const vp = gl.getParameter(gl.VIEWPORT); ...; gl.viewport(vp[0],
+	// vp[1], vp[2], vp[3])`) silently restores garbage instead of throwing.
+	// Found 2026-09-12 while probing the mirrored-band bug: the probe's own
+	// readout came back `vp=[number:0]`, which is what exposed it. Sibling
+	// array-valued cases (COLOR_CLEAR_VALUE, COLOR_WRITEMASK,
+	// MAX_VIEWPORT_DIMS) were all present — these two were simply missed.
+	case GL_VIEWPORT:
+	case GL_SCISSOR_BOX: {
+		GLint v[4] = {0, 0, 0, 0};
+		glGetIntegerv(pname, v);
+		Local<ArrayBuffer> ab = ArrayBuffer::New(iso, 16);
+		memcpy(ab->Data(), v, 16);
+		info.GetReturnValue().Set(Int32Array::New(ab, 0, 4));
 		return;
 	}
 	case NX_GL_MAX_VIEWPORT_DIMS: {
@@ -2911,6 +3726,7 @@ FN(w_buffer_sub_data) {
 		len = ab->ByteLength();
 	}
 	apply_webgl2_src_offset(info, 2, 3, &p, &len, true);
+	vbo_upload_probe(target, offset, p, len);
 	if (p) glBufferSubData(target, offset, (GLsizeiptr)len, p);
 }
 
@@ -3085,17 +3901,30 @@ FN(w_bind_texture) {
 	}
 	const GLuint tex = obj_id(info[1]);
 	glBindTexture(target, tex);
-	// Track TU0 TEXTURE_2D binding to match nx_gl_state_snap_t coverage.
-	if (st && target == GL_TEXTURE_2D &&
-		st->user_snap.active_tex == (GLint)GL_TEXTURE0) {
-		st->user_snap.tex2d_binding = (GLint)tex;
+	// Track the TEXTURE_2D binding for the CURRENTLY ACTIVE unit - not only
+	// TEXTURE0. The old form recorded a bind only when the active unit happened
+	// to be TEXTURE0, so `activeTexture(u1); bindTexture(t4)` was dropped and
+	// unit 1 was never restored after Skia ran. Invisible to an app that rebinds
+	// every frame; fatal to one that caches a multi-texture batch and stops.
+	if (st && target == GL_TEXTURE_2D) {
+		const int unit = (int)(st->user_snap.active_tex - (GLint)GL_TEXTURE0);
+		if (unit >= 0 && unit < NX_GL_MAX_TRACKED_TEX_UNITS) {
+			st->user_snap.tex2d_units[unit] = (GLint)tex;
+			nx_gl_note_tex_unit(unit);
+		}
+		if (st->user_snap.active_tex == (GLint)GL_TEXTURE0) {
+			st->user_snap.tex2d_binding = (GLint)tex;
+		}
 	}
 }
 FN(w_active_texture) {
 	enter_bracket();
 	const GLenum unit = a_u32(info, 0);
 	glActiveTexture(unit);
-	if (st) st->user_snap.active_tex = (GLint)unit;
+	if (st) {
+		st->user_snap.active_tex = (GLint)unit;
+		nx_gl_note_tex_unit((int)unit - (int)GL_TEXTURE0);
+	}
 }
 
 // Ledger #95b — WebGL 1 spec §5.14.8: texParameter{i,f} on a target with no
@@ -3612,6 +4441,8 @@ FN(w_tex_image_2d) {
 		if (flipped) pixels = (void *)flipped;
 	}
 	bucket_e_translate_tex_image(&internalformat, &format, &type);
+	tex_probe("texImage2D", target, level, internalformat, format, type,
+	          width, height, scratch.size() > 0, pixels);
 	glTexImage2D(target, level, internalformat, width, height, border, format,
 	             type, pixels);
 	if (alignment_overridden) {
@@ -3995,15 +4826,21 @@ FN(w_tex_storage_2d) {
 // target — matches the v1 w_draw_arrays / w_draw_elements pattern.
 FN(w_draw_arrays_instanced) {
 	enter_bracket();
+	rt_census();
+	draw_probe("drawArraysInstanced", a_u32(info, 0), a_i32(info, 2));
 	glDrawArraysInstanced(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2),
 	                      a_i32(info, 3));
+	draw_probe_after("drawArraysInstanced");
 	touch_fbo();
 }
 FN(w_draw_elements_instanced) {
 	enter_bracket();
+	rt_census();
+	draw_probe("drawElementsInstanced", a_u32(info, 0), a_i32(info, 1));
 	glDrawElementsInstanced(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
 	                        (const void *)(intptr_t)a_i64(info, 3),
 	                        a_i32(info, 4));
+	draw_probe_after("drawElementsInstanced");
 	touch_fbo();
 }
 FN(w_vertex_attrib_divisor) {
@@ -4310,14 +5147,20 @@ FN(w_draw_arrays) {
 	enter_bracket();
 	// Ledger #100 — see nx_fbo_complete_or_record_error.
 	if (!nx_fbo_complete_or_record_error()) return;
+	rt_census();
+	draw_probe("drawArrays", a_u32(info, 0), a_i32(info, 2));
 	glDrawArrays(a_u32(info, 0), a_i32(info, 1), a_i32(info, 2));
+	draw_probe_after("drawArrays");
 	touch_fbo();
 }
 FN(w_draw_elements) {
 	enter_bracket();
 	if (!nx_fbo_complete_or_record_error()) return;
+	rt_census();
+	draw_probe("drawElements", a_u32(info, 0), a_i32(info, 1));
 	glDrawElements(a_u32(info, 0), a_i32(info, 1), a_u32(info, 2),
 	               (const void *)(intptr_t)a_i64(info, 3));
+	draw_probe_after("drawElements");
 	touch_fbo();
 }
 
@@ -4363,6 +5206,80 @@ FN(w_set_bridge_auto_flush) {
 	info.GetReturnValue().Set(Boolean::New(iso, true));
 }
 
+// Compose probe (2026-09-12). The pixifilters demo composites a page canvas
+// whose Skia-side result reads pure white (`[gl] px postCopyBridge
+// y8=255,255,255,255`) while the GL trace shows PIXI drawing a full 1280x720
+// scene. Exactly two things can produce that, and no amount of reading the
+// trace separates them: the tenant FBO we blit from does not hold the scene
+// (wrong tenant, or the app's last pass never landed in it), or it does and the
+// Skia blit loses it. So sample the FBO we are ABOUT to blit, right here.
+//
+// Reads through GL_READ_FRAMEBUFFER only, with the previous read binding and
+// pack-buffer binding saved and restored, so Skia's draw state is untouched -
+// a diagnostic that changes rendering is worse than none.
+static uint64_t s_compose_probe_n = 0;
+static void compose_probe(uint32_t tid, int sx, int sy, int sw, int sh,
+                          int dx, int dy) {
+	if (!DRAW_PROBE_ON) return;
+	s_compose_probe_n++;
+	// First 3 composes, then every 60th: enough to see startup AND steady state.
+	if (s_compose_probe_n > 3 && (s_compose_probe_n % 60) != 0) return;
+
+	GLuint fbo = nx_webgl_bridge_tenant_fbo(tid);
+	int tw = 0, th = 0;
+	nx_webgl_bridge_tenant_size(tid, &tw, &th);
+
+	GLint prev_read = 0, prev_pack = 0;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pack);
+	if (prev_pack) glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+
+	// GL reads bottom-up; sample a low, a middle and a high row so a scene
+	// that only half-landed is still visible as a difference between them.
+	unsigned char px[3][4] = {{0}};
+	const int xs = sw > 2 ? sw / 2 : 0;
+	const int ys[3] = {sh > 8 ? 8 : 0, sh > 2 ? sh / 2 : 0, sh > 8 ? sh - 8 : 0};
+	for (int i = 0; i < 3; i++) {
+		glReadPixels(xs, ys[i], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px[i]);
+	}
+	GLenum err = glGetError();
+
+	// Also sample every render target the census has seen. The tenant FBO
+	// alone cannot say WHERE the scene is when it comes back blank - with
+	// `useBackBuffer` the frame lives in an offscreen target and only reaches
+	// the tenant when PIXI blits, so reading the back buffer in the same
+	// instant separates `the app never drew it` from `the blit did not land`.
+	char census[256];
+	int co = 0;
+	census[0] = 0;
+	for (unsigned i = 0; i < s_rt_seen_n && co < 200; i++) {
+		if (s_rt_seen[i] < 0) continue;
+		unsigned char cp[4] = {0, 0, 0, 0};
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)s_rt_seen[i]);
+		glReadPixels(xs, ys[1], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, cp);
+		co += snprintf(census + co, sizeof(census) - (size_t)co,
+		               " fbo%d=%u,%u,%u,%u", (int)s_rt_seen[i], cp[0], cp[1],
+		               cp[2], cp[3]);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+	if (prev_pack) glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pack);
+
+	fprintf(stderr,
+	        "[compose-probe] #%llu tenant=%u fbo=%u tenant_size=%dx%d "
+	        "src=%d,%d %dx%d dst=%d,%d\n",
+	        (unsigned long long)s_compose_probe_n, tid, (unsigned)fbo, tw, th,
+	        sx, sy, sw, sh, dx, dy);
+	fprintf(stderr,
+	        "[compose-probe]   fbo px y%d=%u,%u,%u,%u y%d=%u,%u,%u,%u "
+	        "y%d=%u,%u,%u,%u err=0x%x\n",
+	        ys[0], px[0][0], px[0][1], px[0][2], px[0][3],
+	        ys[1], px[1][0], px[1][1], px[1][2], px[1][3],
+	        ys[2], px[2][0], px[2][1], px[2][2], px[2][3], (unsigned)err);
+	fprintf(stderr, "[compose-probe]   census px%s\n", census);
+	fflush(stderr);
+}
+
 FN(w_copy_bridge_to_canvas) {
 	// gl.copyBridgeToCanvas(srcX, srcY, srcW, srcH, dst_canvas, dstX, dstY)
 	//   → bool ok
@@ -4406,6 +5323,7 @@ FN(w_copy_bridge_to_canvas) {
 	// Compose THIS canvas's own tenant FBO into its DOM slot (use_ctx set `st`
 	// from info.This()), so stacked WebGL canvases each show their own pixels.
 	const uint32_t tid = st ? st->tenant_id : 0;
+	compose_probe(tid, sx, sy, sw, sh, dx, dy);
 	const bool ok = nx_webgl_bridge_tenant_compose_rect(target, tid, sx, sy, sw,
 	                                                     sh, dx, dy);
 	info.GetReturnValue().Set(Boolean::New(iso, ok));
@@ -5209,7 +6127,16 @@ FN(w_is_sampler) {
 }
 FN(w_bind_sampler) {
 	enter_bracket();
-	glBindSampler(a_u32(info, 0), obj_id(info[1]));
+	const GLuint unit = a_u32(info, 0);
+	const GLuint samp = obj_id(info[1]);
+	glBindSampler(unit, samp);
+	// Record it - this setter previously wrote nothing into user_snap, so the
+	// page's sampler binds were invisible to the restore path entirely.
+	if (st && unit < (GLuint)NX_GL_MAX_TRACKED_TEX_UNITS) {
+		st->user_snap.sampler_units[unit] = (GLint)samp;
+		nx_gl_note_tex_unit((int)unit);
+		if (unit == 0) st->user_snap.sampler_unit0 = (GLint)samp;
+	}
 }
 FN(w_sampler_parameter_i) {
 	enter_bracket();

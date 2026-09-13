@@ -2289,6 +2289,26 @@ void nx_canvas_context_2d_put_image_data(
 	    !info[2]->Int32Value(jsctx).To(&dy))
 		return;
 	bool gpu = context->canvas->gpu;
+	// Internal marker (NOT web-facing): the source bytes are ALREADY
+	// premultiplied, so the conversion below must only swizzle RGBA->BGRA
+	// and must NOT multiply by alpha a second time.
+	//
+	// Set by the runtime WebGL readback path (canvas-runner
+	// readbackWebGLEntries), which blits `gl.readPixels` output into a
+	// <canvas> offscreen. A WebGL drawing buffer is premultiplied by
+	// contract - `getContextAttributes()` reports premultipliedAlpha:true -
+	// so those pixels arrive premultiplied, while `ImageData` is SPECIFIED
+	// as straight alpha. Without this flag every pixel with 0 < a < 255 got
+	// premultiplied TWICE: colours darkened by a factor of alpha and soft
+	// alpha edges turned into visible dark boxes. Opaque pixels (a == 255)
+	// were unaffected, which is why a fully opaque scene looked perfect and
+	// only content with real transparency was wrong.
+	bool src_premultiplied = false;
+	{
+		Local<Value> pm_v;
+		if (id->Get(jsctx, nx_str(iso, "__nxPremultiplied")).ToLocal(&pm_v))
+			src_premultiplied = pm_v->IsTrue();
+	}
 	int srcStride = image_data_width * 4;
 	int argc = info.Length();
 	if (argc == 3) {
@@ -2338,6 +2358,14 @@ void nx_canvas_context_2d_put_image_data(
 	for (int y = 0; y < rows; ++y) {
 		uint8_t *dstRow = dst;
 		uint8_t *srcRow = src;
+		if (src_premultiplied) {
+			// Swizzle only. Destination is kPremul_SkAlphaType BGRA, which is
+			// exactly what we already have modulo channel order.
+			for (int x = 0; x < cols; ++x) {
+				uint8_t r = *srcRow++, g = *srcRow++, b = *srcRow++, a = *srcRow++;
+				*dstRow++ = b; *dstRow++ = g; *dstRow++ = r; *dstRow++ = a;
+			}
+		} else {
 		for (int x = 0; x < cols; ++x) {
 			uint8_t r = *srcRow++, g = *srcRow++, b = *srcRow++, a = *srcRow++;
 			if (a == 0) {
@@ -2349,6 +2377,7 @@ void nx_canvas_context_2d_put_image_data(
 				*dstRow++ = b * alpha; *dstRow++ = g * alpha;
 				*dstRow++ = r * alpha; *dstRow++ = a;
 			}
+		}
 		}
 		dst += dstStride;
 		src += srcStride;

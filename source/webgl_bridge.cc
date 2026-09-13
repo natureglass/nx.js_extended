@@ -202,6 +202,38 @@ bool create_fbo_resources(int w, int h, GLuint *out_fbo, GLuint *out_color,
 	        "[bridge-fbo:complete] %dx%d color=RGBA8 depth=24 stencil=8 (combined attach)\n",
 	        w, h);
 	fflush(stderr);
+	// A freshly allocated colour texture has UNDEFINED contents (glTexImage2D
+	// with a null pixel pointer) and nothing else ever initialises this FBO. An
+	// app that clears its own default framebuffer every frame never notices; one
+	// that renders to an offscreen target and blits only when it decides to
+	// (PIXI v8 with useBackBuffer) composites whatever the driver left
+	// in the allocation. On Citron that is opaque WHITE - 2026-09-12, the
+	// pixifilters demo composited fbo px y8=255,255,255,255 from tenant 3
+	// while its scene sat in the back buffer. Start every tenant transparent.
+	GLint prev_fbo = 0;
+	GLfloat prev_cc[4] = {0.f, 0.f, 0.f, 0.f};
+	GLboolean prev_mask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+	GLboolean prev_depth_mask = GL_TRUE;
+	GLint prev_stencil_mask = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, prev_cc);
+	glGetBooleanv(GL_COLOR_WRITEMASK, prev_mask);
+	glGetBooleanv(GL_DEPTH_WRITEMASK, &prev_depth_mask);
+	glGetIntegerv(GL_STENCIL_WRITEMASK, &prev_stencil_mask);
+	const GLboolean prev_scissor = glIsEnabled(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	if (prev_scissor) glDisable(GL_SCISSOR_TEST);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glDepthMask(GL_TRUE);
+	glStencilMask(0xFFu);
+	glClearColor(0.f, 0.f, 0.f, 0.f);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+	glClearColor(prev_cc[0], prev_cc[1], prev_cc[2], prev_cc[3]);
+	glColorMask(prev_mask[0], prev_mask[1], prev_mask[2], prev_mask[3]);
+	glDepthMask(prev_depth_mask);
+	glStencilMask((GLuint)prev_stencil_mask);
+	if (prev_scissor) glEnable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
 	*out_fbo = fbo;
 	*out_color = color_tex;
 	*out_depth = depth_rb;
@@ -679,6 +711,14 @@ static void nx_active_probe_read_back(void) {
 // State save/restore primitive (public — re-used by 2.C+ WebGL bridge).
 // ---------------------------------------------------------------------------
 
+// Grows as the page binds higher units; stays 1 until it binds above unit 0.
+static int s_tracked_tex_units = 1;
+int nx_gl_tracked_tex_units(void) { return s_tracked_tex_units; }
+void nx_gl_note_tex_unit(int unit) {
+	if (unit < 0 || unit >= NX_GL_MAX_TRACKED_TEX_UNITS) return;
+	if (unit + 1 > s_tracked_tex_units) s_tracked_tex_units = unit + 1;
+}
+
 void nx_gl_state_save(nx_gl_state_snap_t *s) {
 	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &s->fbo);
 	glGetIntegerv(GL_VIEWPORT, s->viewport);
@@ -712,6 +752,23 @@ void nx_gl_state_save(nx_gl_state_snap_t *s) {
 	glGetIntegerv(GL_SAMPLER_BINDING, &s->sampler_unit0);
 	glActiveTexture((GLenum)s->active_tex);
 	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &s->read_fbo);
+	// Per-unit TEXTURE_2D bindings. Walks only the units the page has actually
+	// bound to, so a single-unit page does exactly one pass over unit 0 and its
+	// cost is unchanged.
+	{
+		const int n = nx_gl_tracked_tex_units();
+		for (int i = 0; i < n && i < NX_GL_MAX_TRACKED_TEX_UNITS; i++) {
+			glActiveTexture((GLenum)(GL_TEXTURE0 + i));
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &s->tex2d_units[i]);
+			// GL_SAMPLER_BINDING reads the ACTIVE unit, so it rides this same loop.
+			glGetIntegerv(GL_SAMPLER_BINDING, &s->sampler_units[i]);
+		}
+		for (int i = n; i < NX_GL_MAX_TRACKED_TEX_UNITS; i++) {
+			s->tex2d_units[i] = 0;
+			s->sampler_units[i] = 0;
+		}
+		glActiveTexture((GLenum)s->active_tex);
+	}
 }
 
 void nx_gl_state_restore(const nx_gl_state_snap_t *s) {
@@ -735,8 +792,28 @@ void nx_gl_state_restore(const nx_gl_state_snap_t *s) {
 	// restore so the caller's active unit ends up as it was saved.
 	glActiveTexture(GL_TEXTURE0);
 	glBindSampler(0, (GLuint)s->sampler_unit0);
+	// Restore every tracked unit BEFORE the active-unit + legacy single-binding
+	// restore below, so the legacy field still wins for the active unit and this
+	// remains a pure superset of the previous behaviour.
+	{
+		const int n = nx_gl_tracked_tex_units();
+		for (int i = 0; i < n && i < NX_GL_MAX_TRACKED_TEX_UNITS; i++) {
+			glActiveTexture((GLenum)(GL_TEXTURE0 + i));
+			glBindTexture(GL_TEXTURE_2D, (GLuint)s->tex2d_units[i]);
+		}
+	}
 	glActiveTexture((GLenum)s->active_tex);
 	glBindTexture(GL_TEXTURE_2D, (GLuint)s->tex2d_binding);
+	// Samplers LAST: unlike tex2d_binding, the legacy `sampler_unit0` field is not
+	// maintained by any w_* setter, so the per-unit values must win over the
+	// glBindSampler(0, sampler_unit0) above rather than the other way round.
+	// glBindSampler takes the unit index directly - no activeTexture needed.
+	{
+		const int n = nx_gl_tracked_tex_units();
+		for (int i = 0; i < n && i < NX_GL_MAX_TRACKED_TEX_UNITS; i++) {
+			glBindSampler((GLuint)i, (GLuint)s->sampler_units[i]);
+		}
+	}
 	if (s->blend)        glEnable(GL_BLEND);        else glDisable(GL_BLEND);
 	if (s->depth_test)   glEnable(GL_DEPTH_TEST);   else glDisable(GL_DEPTH_TEST);
 	if (s->cull)         glEnable(GL_CULL_FACE);    else glDisable(GL_CULL_FACE);

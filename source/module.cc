@@ -218,6 +218,28 @@ MaybeLocal<Module> load_module(Isolate *iso, const std::string &url,
 		size_t len = 0;
 		char *src = read_module_file(path.c_str(), &len);
 		if (!src) {
+			// Diagnostic: this is the ONLY failure mode that can strand a
+			// dynamic import() of a non-fopen-able scheme (brewser://,
+			// http(s)://). The resolver already succeeded -- we have a
+			// fully-qualified URL -- so reaching here means the prefetch
+			// registry did not hold this exact key. Dump the registry so the
+			// log distinguishes the three possibilities: (a) the runtime never
+			// prefetched it (registry has no sibling keys), (b) it prefetched
+			// under a DIFFERENT string (near-miss keys visible), or (c) it was
+			// prefetched and then purged by moduleClearPage before this
+			// asynchronous import fired (registry empty but page_base set).
+			fprintf(stderr, "[module] MISS url=%s prefetch_n=%zu page_base=%s\n",
+			        url.c_str(), g_prefetch_sources.size(),
+			        page_base.empty() ? "(none)" : page_base.c_str());
+			{
+				int shown = 0;
+				for (const auto &kv : g_prefetch_sources) {
+					fprintf(stderr, "[module]   have[%d]=%s (%zuB)\n", shown,
+					        kv.first.c_str(), kv.second.size());
+					if (++shown >= 16) break;
+				}
+			}
+			fflush(stderr);
 			char msg[1024];
 			snprintf(msg, sizeof(msg), "Cannot find module '%s'",
 			         url.c_str());

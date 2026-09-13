@@ -118,13 +118,31 @@ static void nx_uv_after_work_cb(uv_work_t *uvreq, int status) {
 	delete req;
 
 	// Drain microtasks scheduled by the resolve/reject (the loop also does
-	// this each frame, but doing it here keeps short async chains snappy).
-	iso->PerformMicrotaskCheckpoint();
-
-	// If the native heap is running low (high-rate ArrayBuffer producers
-	// outpacing GC), ask V8 to reclaim unreferenced external backing stores
-	// now, before the loop starts the next op. See the helper above.
-	nx_async_relieve_native_pressure(iso);
+	// this each frame, but doing it here keeps short async chains snappy),
+	// then relieve native heap pressure (see the helper above).
+	//
+	// MUST run under its own Isolate::Scope + HandleScope. Promise reaction
+	// jobs allocate handles, and during teardown NOTHING else on the stack
+	// provides a scope: main()'s `{ Isolate::Scope; HandleScope;
+	// Context::Scope }` block is popped BEFORE the exit path's
+	// `nx_close_uv_handles(loop, /*drain=*/true)` pumps `uv_run`, which is
+	// what fires this callback for work that was still in flight. The scopes
+	// above were popped at the end of the resolve/reject block, so calling
+	// PerformMicrotaskCheckpoint() bare crashed the process:
+	//   # Fatal error in v8::HandleScope::CreateHandle()
+	//   # Cannot create a handle without a HandleScope
+	// Observed 2026-09-12 when a page died mid-flight with pending fetch()
+	// work (PIXI app whose renderer chunk failed to load), so the exit drain
+	// had queued after-work callbacks to run. In-loop (non-teardown) calls
+	// were unaffected — the frame loop's HandleScope covered them — which is
+	// why this only ever showed up on exit. Isolate::Scope nests safely when
+	// the isolate is already entered.
+	{
+		Isolate::Scope iso_scope(iso);
+		HandleScope scope(iso);
+		iso->PerformMicrotaskCheckpoint();
+		nx_async_relieve_native_pressure(iso);
+	}
 
 	(void)ctx;
 	(void)status;

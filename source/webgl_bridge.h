@@ -118,6 +118,10 @@
 // If 2.C/2.D surfaces "Skia renders garbage after WebGL draws" symptoms on
 // hardware, the FIRST place to look is this list — a missing entry under a
 // new code path is the most likely cause.
+// Upper bound on texture units the snapshot will save/restore. WebGL 2
+// guarantees at least 16 combined; PIXI caps its batch at 16.
+#define NX_GL_MAX_TRACKED_TEX_UNITS 16
+
 struct nx_gl_state_snap_t {
 	GLint fbo;
 	GLint viewport[4];
@@ -142,11 +146,37 @@ struct nx_gl_state_snap_t {
 	// Patch #17 (from #16-ACTIVE hw probe SUMMARY needs_snap={sampler_unit0,read_fbo}):
 	GLint sampler_unit0;         // Skia binds sampler obj 2 to unit 0 + leaves it
 	GLint read_fbo;              // Ganesh assumes READ_FRAMEBUFFER = 0 at frame start
+	// 2026-09-12: TEXTURE_2D binding for every tracked unit, not just one.
+	// Previously the snapshot held a single `tex2d_binding` (the ACTIVE unit),
+	// and w_bind_texture only recorded a bind when the active unit happened to
+	// be TEXTURE0 - so a multi-texture batch (PIXI v8 binds several units and
+	// selects per-vertex) had units 1..N neither saved nor restored across the
+	// Skia bracket. Apps that rebind every frame masked it by repairing their
+	// own state; a cached batch that stops rebinding sampled whatever Ganesh
+	// left on those units - foreign textures, including the tenant FBO's own
+	// colour attachment, which renders as a vertically flipped copy of the
+	// scene. Only units the page has actually touched are walked (see
+	// nx_gl_tracked_tex_units), so single-unit pages cost exactly what they did
+	// before.
+	GLint tex2d_units[NX_GL_MAX_TRACKED_TEX_UNITS];
+	// Sampler-object binding per unit, same gap as tex2d_units. `sampler_unit0`
+	// above covers exactly one unit AND is never shadow-written by w_bind_sampler,
+	// so a page's sampler binds were not recorded at all: restore rebound the
+	// SEEDED value on unit 0 (wiping the page's) and left units 1..N holding
+	// Ganesh's samplers. A wrong sampler changes wrap/filter rather than which
+	// texture is read - which is why it survived the tex2d_units fix as a subtler
+	// artifact (part of a stretched gradient sampling wrong) instead of a
+	// completely wrong image.
+	GLint sampler_units[NX_GL_MAX_TRACKED_TEX_UNITS];
 };
 
 // Capture / restore the GL state contract. The caller owns the snap struct.
 // gr->resetContext() is NOT called here — the caller does it after restore
 // so the choice (per-section vs batched) is explicit at the call site.
+// Highest texture unit index the page has bound to (+1 = count to walk). Stays
+// 1 for single-unit pages so their save/restore cost is unchanged.
+int nx_gl_tracked_tex_units(void);
+void nx_gl_note_tex_unit(int unit);
 void nx_gl_state_save(nx_gl_state_snap_t *s);
 void nx_gl_state_restore(const nx_gl_state_snap_t *s);
 

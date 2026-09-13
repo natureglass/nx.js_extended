@@ -294,14 +294,53 @@ uint8_t *decode_png(uint8_t *input, size_t input_size, u32 *width,
 	png_read_info(png_ptr, info_ptr);
 	*width = png_get_image_width(png_ptr, info_ptr);
 	*height = png_get_image_height(png_ptr, info_ptr);
+	// Capture what the FILE says BEFORE any transform: this is what decides
+	// whether any pixel can have alpha < 255. After the transforms below every
+	// image is nominally RGBA, so asking afterwards answers a different
+	// question.
+	//
+	// THE BUG (2026-09-12, fixed here): this used to be
+	//     has_alpha = png_get_color_type(...) == PNG_COLOR_TYPE_RGBA;
+	// which is false for three cases that DO carry transparency - PALETTE with
+	// tRNS, RGB with tRNS, and GREY_ALPHA - so `premultiply_alpha()` below was
+	// skipped for them. Everything downstream treats nx_image_t as
+	// premultiplied BGRA (w_tex_image_2d hardcodes un_premultiply = false), so
+	// those images reached the GPU as STRAIGHT alpha while being blended as
+	// premultiplied.
+	//
+	// How it surfaced: the pixi-filters demo's `overlay.png` is a palette PNG
+	// whose transparent texels decode to (255,255,255,0). PIXI draws it as a
+	// full-screen TilingSprite with src=ONE, dst=ONE_MINUS_SRC_ALPHA, so every
+	// such texel computes 1 + dst*(1-0) - it ADDS full white and subtracts
+	// nothing, and the whole frame saturated to white. A premultiplied texel
+	// can never have a channel above its alpha, which is precisely the
+	// invariant those samples violated (rgb=255 > a=0).
+	const png_byte file_color_type = png_get_color_type(png_ptr, info_ptr);
+	const bool file_has_trns =
+	    png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS) != 0;
+	const bool has_alpha =
+	    (file_color_type & PNG_COLOR_MASK_ALPHA) != 0 || file_has_trns;
+
+	// Normalise every input to 8-bit BGRA before reading rows: expand
+	// palette / tRNS / sub-8-bit, drop 16-bit channels (the buffer below is 4
+	// bytes per pixel - a 16-bit PNG would otherwise need 8 and overflow it),
+	// promote grey to RGB, and guarantee an alpha channel.
 	png_set_bgr(png_ptr);
 	png_set_expand(png_ptr);
-	bool has_alpha =
-	    png_get_color_type(png_ptr, info_ptr) == PNG_COLOR_TYPE_RGBA;
-	if (!has_alpha)
-		png_set_add_alpha(png_ptr, 0xff, PNG_FILLER_AFTER);
+	png_set_strip_16(png_ptr);
+	png_set_gray_to_rgb(png_ptr);
+	png_set_add_alpha(png_ptr, 0xff, PNG_FILLER_AFTER);
+	// Make info_ptr describe the POST-transform rows so the stride check below
+	// is meaningful.
+	png_read_update_info(png_ptr, info_ptr);
 	if (*width == 0 || *height == 0 || *width > 16384 || *height > 16384 ||
 	    (size_t)(*width) > SIZE_MAX / 4 / (*height)) {
+		png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+		return NULL;
+	}
+	// The row pointers below hand libpng a 4-bytes-per-pixel buffer; refuse
+	// anything whose post-transform stride disagrees rather than overflowing it.
+	if (png_get_rowbytes(png_ptr, info_ptr) != (png_size_t)(4 * (size_t)(*width))) {
 		png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
 		return NULL;
 	}
