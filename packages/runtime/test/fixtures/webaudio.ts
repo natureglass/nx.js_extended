@@ -892,3 +892,151 @@ test('DynamicsCompressorNode compresses a loud signal', async (t) => {
 	t.ok(Number.isFinite(steadyPeak) && steadyPeak > 0, 'still passes audio');
 	t.ok(steadyPeak < 1.5, 'output stays bounded (no runaway gain)');
 });
+
+// --- BiquadFilterNode ---
+
+test('BiquadFilterNode basics', (t) => {
+	const ctx = new OfflineAudioContext(1, 384, RATE);
+	const filter = ctx.createBiquadFilter();
+	t.ok(
+		filter instanceof BiquadFilterNode,
+		'createBiquadFilter returns a BiquadFilterNode',
+	);
+	t.ok(filter instanceof AudioNode, 'BiquadFilterNode instanceof AudioNode');
+	t.equal(filter.type, 'lowpass', 'type defaults to lowpass');
+	t.equal(filter.frequency.value, 350, 'frequency default');
+	t.equal(filter.detune.value, 0, 'detune default');
+	t.equal(filter.Q.value, 1, 'Q default');
+	t.equal(filter.gain.value, 0, 'gain default');
+	for (const type of [
+		'highpass',
+		'bandpass',
+		'lowshelf',
+		'highshelf',
+		'peaking',
+		'notch',
+		'allpass',
+		'lowpass',
+	] as BiquadFilterType[]) {
+		filter.type = type;
+		t.equal(filter.type, type, `type round-trips: ${type}`);
+	}
+});
+
+test('BiquadFilterNode getFrequencyResponse', (t) => {
+	const ctx = new OfflineAudioContext(1, 384, RATE);
+	const filter = ctx.createBiquadFilter();
+	filter.type = 'lowpass';
+	filter.frequency.value = 1000;
+	const freq = new Float32Array([20, 20000, RATE]);
+	const mag = new Float32Array(3);
+	const phase = new Float32Array(3);
+	filter.getFrequencyResponse(freq, mag, phase);
+	// The transfer function is spelled out by the spec, so these are
+	// engine-invariant rather than implementation detail.
+	t.ok(closeTo(mag[0], 1, 0.05), 'lowpass passes 20 Hz (|H| ~ 1)');
+	t.ok(mag[1] < 0.05, 'lowpass rejects 20 kHz');
+	t.ok(Number.isNaN(mag[2]), 'frequency above Nyquist yields NaN');
+	t.ok(Number.isFinite(phase[0]), 'phase is finite in the passband');
+	let threw = false;
+	try {
+		filter.getFrequencyResponse(freq, new Float32Array(2), phase);
+	} catch (err) {
+		threw = err instanceof TypeError;
+	}
+	t.ok(threw, 'mismatched array lengths throw a TypeError');
+});
+
+test('BiquadFilterNode filters the signal', async (t) => {
+	// A lowpass well below the tone must remove it; well above must keep it.
+	const N = 8192;
+	async function renderTone(hz: number, cutoff: number): Promise<number> {
+		const ctx = new OfflineAudioContext(1, N, RATE);
+		const buffer = ctx.createBuffer(1, N, RATE);
+		const data = buffer.getChannelData(0);
+		for (let i = 0; i < N; i++)
+			data[i] = Math.sin((2 * Math.PI * hz * i) / RATE);
+		const source = ctx.createBufferSource();
+		source.buffer = buffer;
+		const filter = ctx.createBiquadFilter();
+		filter.type = 'lowpass';
+		filter.frequency.value = cutoff;
+		source.connect(filter);
+		filter.connect(ctx.destination);
+		source.start();
+		const out = (await ctx.startRendering()).getChannelData(0);
+		return peakAbs(out, N / 2, N); // measure once settled
+	}
+	const passed = await renderTone(200, 2000);
+	const rejected = await renderTone(12000, 2000);
+	t.ok(passed > 0.8, 'lowpass 2 kHz passes a 200 Hz tone');
+	t.ok(rejected < 0.1, 'lowpass 2 kHz rejects a 12 kHz tone');
+});
+
+// --- ConvolverNode ---
+
+test('ConvolverNode basics', (t) => {
+	const ctx = new OfflineAudioContext(1, 384, RATE);
+	const conv = ctx.createConvolver();
+	t.ok(conv instanceof ConvolverNode, 'createConvolver returns a ConvolverNode');
+	t.ok(conv instanceof AudioNode, 'ConvolverNode instanceof AudioNode');
+	t.equal(conv.buffer, null, 'buffer starts null');
+	t.equal(conv.normalize, true, 'normalize defaults to true');
+	const ir = ctx.createBuffer(1, 128, RATE);
+	conv.buffer = ir;
+	t.equal(conv.buffer, ir, 'buffer round-trips');
+	conv.buffer = null;
+	t.equal(conv.buffer, null, 'buffer can be cleared');
+});
+
+test('ConvolverNode with no impulse response is silent', async (t) => {
+	const N = 4096;
+	const ctx = new OfflineAudioContext(1, N, RATE);
+	const buffer = ctx.createBuffer(1, N, RATE);
+	buffer.getChannelData(0).fill(1);
+	const source = ctx.createBufferSource();
+	source.buffer = buffer;
+	const conv = ctx.createConvolver();
+	source.connect(conv);
+	conv.connect(ctx.destination);
+	source.start();
+	const out = (await ctx.startRendering()).getChannelData(0);
+	t.ok(peakAbs(out, 0, N) < 1e-4, 'outputs silence, not a passthrough');
+});
+
+test('ConvolverNode convolves with an impulse response', async (t) => {
+	// A single-sample impulse response is an identity convolution, so the
+	// output carries the same energy as the input. Asserted as total energy
+	// rather than sample-by-sample because implementations are free to add
+	// latency (nx.js convolves a partition at a time, so it delays by one).
+	const N = 16384;
+	const ctx = new OfflineAudioContext(1, N, RATE);
+	const buffer = ctx.createBuffer(1, 4096, RATE);
+	const data = buffer.getChannelData(0);
+	let want = 0;
+	for (let i = 0; i < data.length; i++) {
+		data[i] = 0.5 * Math.sin((2 * Math.PI * 440 * i) / RATE);
+		want += data[i] * data[i];
+	}
+	const ir = ctx.createBuffer(1, 64, RATE);
+	ir.getChannelData(0)[0] = 1;
+
+	const source = ctx.createBufferSource();
+	source.buffer = buffer;
+	const conv = ctx.createConvolver();
+	conv.normalize = false; // set before assigning the buffer, per spec
+	conv.buffer = ir;
+	source.connect(conv);
+	conv.connect(ctx.destination);
+	source.start();
+
+	const out = (await ctx.startRendering()).getChannelData(0);
+	let got = 0;
+	for (let i = 0; i < out.length; i++) got += out[i] * out[i];
+	t.ok(got > 0, 'convolver passes audio once a response is set');
+	t.ok(
+		Math.abs(got - want) / want < 0.02,
+		'a unit impulse response preserves the signal energy',
+	);
+	t.ok(peakAbs(out, 0, N) < 1.01, 'output stays bounded');
+});

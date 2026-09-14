@@ -19,8 +19,10 @@
 #include "media-decoder.h"
 #include "util.h"
 #include "wrap.h"
+#include <atomic>
 #include <stdlib.h>
 #include <string.h>
+#include <v8-external-memory-accounter.h>
 
 using namespace v8;
 
@@ -32,6 +34,37 @@ namespace {
 
 // nx_audio_ctx_t (the graph + optional platform sink) is declared in audio.h
 // so that video.cc can unwrap AudioContext handles too.
+
+// V8 has no visibility into what an AudioNode costs. The JS wrapper is a small
+// object, but each one pins a whole nx_audio_node — a 128-frame stereo bus plus
+// its parameter timelines — and nodes are only ever freed by the wrapper's GC
+// finalizer. Without an external-memory hint, a fire-and-forget app (one
+// oscillator + gain per tracker row, the standard Web Audio idiom) allocates
+// tens of megabytes of nodes before V8 sees enough JS-heap pressure to schedule
+// the major GC that would collect them. Reporting the real cost makes GC track
+// actual memory use, so finished notes are reclaimed instead of accumulating.
+//
+// The release path is a first-pass weak callback, which must not call into V8 at
+// all, so the decrease is accumulated here and flushed from the next binding
+// call that has an isolate in hand.
+constexpr int64_t NODE_EXTERNAL_BYTES = (int64_t)sizeof(nx_audio_node);
+ExternalMemoryAccounter g_node_memory;
+std::atomic<int64_t> g_node_bytes_freed{0};
+
+void audio_external_sync(Isolate *iso, int64_t added) {
+	int64_t delta = added - g_node_bytes_freed.exchange(0);
+	if (delta != 0)
+		g_node_memory.Update(iso, delta);
+}
+
+void release_node(nx_audio_node *n) {
+	nx_audio_node_release(n);
+	g_node_bytes_freed.fetch_add(NODE_EXTERNAL_BYTES);
+}
+
+// The destination node is graph-owned, so wrapping it allocates nothing and its
+// release must not report a decrease.
+void release_destination_node(nx_audio_node *n) { nx_audio_node_release(n); }
 
 void free_audio_ctx(nx_audio_ctx_t *ctx) {
 	if (ctx->sink) {
@@ -138,6 +171,7 @@ void nx_audio_context_current_time(const FunctionCallbackInfo<Value> &info) {
 	nx_audio_ctx_t *ctx = get_ctx(iso, info[0]);
 	if (!ctx)
 		return;
+	audio_external_sync(iso, 0);
 	info.GetReturnValue().Set(
 	    Number::New(iso, nx_audio_graph_current_time(ctx->graph)));
 }
@@ -145,8 +179,6 @@ void nx_audio_context_current_time(const FunctionCallbackInfo<Value> &info) {
 // ---------------------------------------------------------------------------
 // Nodes
 // ---------------------------------------------------------------------------
-
-void release_node(nx_audio_node *n) { nx_audio_node_release(n); }
 
 void nx_audio_context_destination(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
@@ -157,7 +189,8 @@ void nx_audio_context_destination(const FunctionCallbackInfo<Value> &info) {
 	// ref (released via nx_audio_node_release, which special-cases it).
 	nx_audio_graph_ref(ctx->graph);
 	Local<Object> obj = nx::NewWrapped(iso);
-	nx::Wrap<nx_audio_node>(iso, obj, ctx->graph->destination, release_node);
+	nx::Wrap<nx_audio_node>(iso, obj, ctx->graph->destination,
+	                        release_destination_node);
 	info.GetReturnValue().Set(obj);
 }
 
@@ -168,14 +201,28 @@ void nx_audio_node_new(const FunctionCallbackInfo<Value> &info) {
 	if (!ctx)
 		return;
 	int type = arg_i32(info, 1);
-	// JS may create GAIN, STEREO_PANNER, BUFFER_SOURCE, OSCILLATOR, ANALYSER,
-	// DELAY and DYNAMICS_COMPRESSOR nodes; STREAM_SOURCE (4) is engine-internal
-	// (media elements) and is explicitly rejected.
-	if (type != NX_AUDIO_NODE_GAIN && type != NX_AUDIO_NODE_STEREO_PANNER &&
-	    type != NX_AUDIO_NODE_BUFFER_SOURCE &&
-	    type != NX_AUDIO_NODE_OSCILLATOR && type != NX_AUDIO_NODE_ANALYSER &&
-	    type != NX_AUDIO_NODE_DELAY &&
-	    type != NX_AUDIO_NODE_DYNAMICS_COMPRESSOR) {
+	// Every node type JS is allowed to construct. STREAM_SOURCE is deliberately
+	// absent: it is engine-internal (media elements feed it from the decode
+	// thread) and must not be reachable from a page.
+	//
+	// Written as a switch rather than a chain of !=, because adding a node type
+	// and forgetting this allowlist costs a full device debug cycle — the class
+	// and its DSP all exist, the capability probe says the feature is there, and
+	// then construction throws "invalid AudioNode type" from a file nowhere near
+	// the one you just edited. A switch makes the omission visible next to the
+	// enum instead of hiding it in the middle of a boolean expression.
+	switch (type) {
+	case NX_AUDIO_NODE_GAIN:
+	case NX_AUDIO_NODE_STEREO_PANNER:
+	case NX_AUDIO_NODE_BUFFER_SOURCE:
+	case NX_AUDIO_NODE_OSCILLATOR:
+	case NX_AUDIO_NODE_ANALYSER:
+	case NX_AUDIO_NODE_DELAY:
+	case NX_AUDIO_NODE_DYNAMICS_COMPRESSOR:
+	case NX_AUDIO_NODE_BIQUAD_FILTER:
+	case NX_AUDIO_NODE_CONVOLVER:
+		break;
+	default:
 		nx_throw(iso, "invalid AudioNode type");
 		return;
 	}
@@ -184,6 +231,7 @@ void nx_audio_node_new(const FunctionCallbackInfo<Value> &info) {
 	double aux = arg_f64(info, 2);
 	nx_audio_node *n =
 	    nx_audio_node_create(ctx->graph, (nx_audio_node_type)type, aux);
+	audio_external_sync(iso, NODE_EXTERNAL_BYTES);
 	Local<Object> obj = nx::NewWrapped(iso);
 	nx::Wrap<nx_audio_node>(iso, obj, n, release_node);
 	info.GetReturnValue().Set(obj);
@@ -407,6 +455,102 @@ void nx_audio_oscillator_set_type_cb(const FunctionCallbackInfo<Value> &info) {
 }
 
 // ---------------------------------------------------------------------------
+// BiquadFilterNode
+// ---------------------------------------------------------------------------
+
+// audioBiquadSetType(node, type) — `type` is an nx_audio_biquad_type
+void nx_audio_biquad_set_type_cb(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	nx_audio_node *n = get_node(iso, info[0]);
+	if (!n)
+		return;
+	nx_audio_biquad_set_type(n, (int)arg_f64(info, 1));
+}
+
+// audioBiquadFrequencyResponse(node, freqHz, magOut, phaseOut) — all three
+// Float32Arrays of the same length (the caller has already validated that).
+void nx_audio_biquad_frequency_response_cb(
+    const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	nx_audio_node *n = get_node(iso, info[0]);
+	if (!n)
+		return;
+	if (!info[1]->IsFloat32Array() || !info[2]->IsFloat32Array() ||
+	    !info[3]->IsFloat32Array()) {
+		nx_throw(iso, "expected Float32Array");
+		return;
+	}
+	Local<Float32Array> ta[3] = {info[1].As<Float32Array>(),
+	                             info[2].As<Float32Array>(),
+	                             info[3].As<Float32Array>()};
+	float *ptr[3];
+	uint32_t count = UINT32_MAX;
+	for (int i = 0; i < 3; i++) {
+		uint32_t len = (uint32_t)(ta[i]->ByteLength() / sizeof(float));
+		if (len < count)
+			count = len;
+		std::shared_ptr<BackingStore> bs = ta[i]->Buffer()->GetBackingStore();
+		ptr[i] = reinterpret_cast<float *>(
+		    static_cast<uint8_t *>(bs->Data()) + ta[i]->ByteOffset());
+	}
+	nx_audio_biquad_frequency_response(n, ptr[0], ptr[1], ptr[2], count);
+}
+
+// ---------------------------------------------------------------------------
+// ConvolverNode
+// ---------------------------------------------------------------------------
+
+// audioConvolverSetBuffer(node, channels: Float32Array[] | null, length,
+//                         sampleRate, normalize)
+//
+// Unlike the buffer-source equivalent this COPIES: the response is transformed
+// into partitioned spectra at assignment time, so the page is free to reuse or
+// mutate its AudioBuffer afterwards (as the spec allows) without the render
+// thread seeing it change. Passing `null` clears the response.
+void nx_audio_convolver_set_buffer_cb(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	Local<Context> context = iso->GetCurrentContext();
+	nx_audio_node *n = get_node(iso, info[0]);
+	if (!n)
+		return;
+	if (!info[1]->IsArray()) {
+		nx_audio_convolver_set_buffer(n, nullptr, 0, 0, 0, false);
+		return;
+	}
+	Local<Array> arr = info[1].As<Array>();
+	uint32_t num_channels = arr->Length();
+	if (num_channels == 0) {
+		nx_audio_convolver_set_buffer(n, nullptr, 0, 0, 0, false);
+		return;
+	}
+	if (num_channels > NX_AUDIO_DECODE_MAX_CHANNELS)
+		num_channels = NX_AUDIO_DECODE_MAX_CHANNELS;
+	std::vector<const float *> channels;
+	std::vector<std::shared_ptr<BackingStore>> holds;
+	uint32_t length = (uint32_t)arg_f64(info, 2);
+	for (uint32_t i = 0; i < num_channels; i++) {
+		Local<Value> v;
+		if (!arr->Get(context, i).ToLocal(&v))
+			return;
+		if (!v->IsFloat32Array()) {
+			nx_throw(iso, "expected Float32Array channel data");
+			return;
+		}
+		Local<Float32Array> ta = v.As<Float32Array>();
+		// Never trust the caller's `length` past what the arrays hold.
+		uint32_t elements = (uint32_t)(ta->ByteLength() / sizeof(float));
+		if (elements < length)
+			length = elements;
+		std::shared_ptr<BackingStore> bs = ta->Buffer()->GetBackingStore();
+		channels.push_back(reinterpret_cast<const float *>(
+		    static_cast<uint8_t *>(bs->Data()) + ta->ByteOffset()));
+		holds.push_back(std::move(bs));
+	}
+	nx_audio_convolver_set_buffer(n, channels.data(), (int)num_channels, length,
+	                              arg_f64(info, 3), info[4]->BooleanValue(iso));
+}
+
+// ---------------------------------------------------------------------------
 // DynamicsCompressorNode
 // ---------------------------------------------------------------------------
 
@@ -455,14 +599,17 @@ struct decode_audio_t {
 	int num_channels = 0;
 	uint32_t length = 0; // frames
 	uint32_t sample_rate = 0;
+	// Rate the caller wants the buffer resampled to (the destination
+	// AudioContext's rate), 0 = keep the file's native rate.
+	uint32_t target_rate = 0;
 };
 
 void decode_audio_work(nx_work_t *req) {
 	decode_audio_t *data = (decode_audio_t *)req->data;
 	if (!nx_media_decode_audio(data->input, data->input_size, data->channels,
 	                           &data->num_channels, &data->length,
-	                           &data->sample_rate, data->err_buf,
-	                           sizeof(data->err_buf))) {
+	                           &data->sample_rate, data->target_rate,
+	                           data->err_buf, sizeof(data->err_buf))) {
 		data->err_str = data->err_buf;
 	}
 }
@@ -502,7 +649,10 @@ MaybeLocal<Value> decode_audio_after(Isolate *iso, nx_work_t *req) {
 	return result.As<Value>();
 }
 
-// audioDecode(buf) -> Promise<{ channelData: ArrayBuffer[], length, sampleRate }>
+// audioDecode(buf, targetSampleRate) -> Promise<{ channelData: ArrayBuffer[],
+// length, sampleRate }>. `targetSampleRate` (optional, 0 = native) is the
+// destination context's rate: resampling once here beats the buffer-source
+// node's per-sample linear interpolation on every play.
 void nx_audio_decode(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	size_t size = 0;
@@ -515,6 +665,11 @@ void nx_audio_decode(const FunctionCallbackInfo<Value> &info) {
 	data->buffer_val.Reset(iso, info[0]);
 	data->input = buf;
 	data->input_size = size;
+	if (info.Length() > 1 && info[1]->IsNumber()) {
+		double r = arg_f64(info, 1);
+		if (r > 0 && r < 1e7)
+			data->target_rate = (uint32_t)r;
+	}
 	info.GetReturnValue().Set(
 	    nx_queue_async(iso, req, decode_audio_work, decode_audio_after));
 }
@@ -628,6 +783,11 @@ void nx_init_audio(Isolate *iso, Local<Object> init_obj) {
 	            nx_audio_oscillator_set_type_cb);
 	NX_SET_FUNC(init_obj, "audioCompressorReduction",
 	            nx_audio_compressor_reduction_cb);
+	NX_SET_FUNC(init_obj, "audioBiquadSetType", nx_audio_biquad_set_type_cb);
+	NX_SET_FUNC(init_obj, "audioBiquadFrequencyResponse",
+	            nx_audio_biquad_frequency_response_cb);
+	NX_SET_FUNC(init_obj, "audioConvolverSetBuffer",
+	            nx_audio_convolver_set_buffer_cb);
 	NX_SET_FUNC(init_obj, "audioDecode", nx_audio_decode);
 	NX_SET_FUNC(init_obj, "audioOfflineRender", nx_audio_offline_render);
 }

@@ -255,6 +255,12 @@ export type * from './audio/gain-node';
 import './audio/stereo-panner-node';
 export type * from './audio/stereo-panner-node';
 
+import './audio/biquad-filter-node';
+export type * from './audio/biquad-filter-node';
+
+import './audio/convolver-node';
+export type * from './audio/convolver-node';
+
 import './audio/delay-node';
 export type * from './audio/delay-node';
 

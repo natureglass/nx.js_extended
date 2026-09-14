@@ -238,7 +238,10 @@ export class Audio extends EventTarget {
 				}
 				return res.arrayBuffer();
 			})
-			.then((buf) => $.audioDecode(buf))
+			// Decode straight to the shared context's rate — same reason as
+			// BaseAudioContext.decodeAudioData: resample once here rather
+			// than interpolating on every playback.
+			.then((buf) => $.audioDecode(buf, getContext().sampleRate))
 			.then(
 				({ channelData, sampleRate }) => {
 					this.#buffer = createAudioBuffer(

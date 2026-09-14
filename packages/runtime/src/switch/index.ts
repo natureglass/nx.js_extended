@@ -47,6 +47,15 @@ export { WebApplet, type WebAppletOptions } from '../web-applet';
  * brewser runtime does so through its `Switch` proxy.
  */
 export { setFetchRedirectGuard, type RedirectGuard } from '../fetch/fetch';
+// Embedder decoder for image URLs this runtime cannot decode itself. Same
+// shape as the fetch guard above: brewser installs one at app-session start
+// so `<svg><foreignObject>` — which needs an HTML layout, not an image
+// decoder — can become pixels.
+export {
+	setImageRasteriser,
+	type ImageRasteriser,
+	type ImageRasterResult,
+} from '../image';
 
 export type PathLike = string | URL;
 

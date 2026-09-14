@@ -3912,9 +3912,25 @@ FN(w_bind_texture) {
 			st->user_snap.tex2d_units[unit] = (GLint)tex;
 			nx_gl_note_tex_unit(unit);
 		}
-		if (st->user_snap.active_tex == (GLint)GL_TEXTURE0) {
-			st->user_snap.tex2d_binding = (GLint)tex;
-		}
+		// `tex2d_binding` means "TEXTURE_2D binding AT THE ACTIVE UNIT" —
+		// that is exactly what nx_gl_state_save records for it
+		// (glGetIntegerv(GL_TEXTURE_BINDING_2D) reads the active unit), and
+		// nx_gl_state_restore applies it to whatever unit is active at the
+		// end. Maintaining it only for TEXTURE0 made those two disagree, and
+		// the disagreement was destructive rather than merely stale: restore
+		// ends with
+		//     glActiveTexture(active_tex); glBindTexture(2D, tex2d_binding);
+		// so whenever a page finished its binds on a NON-ZERO unit, that unit
+		// got stamped with unit 0's texture — clobbering the per-unit restore
+		// that had just put the right one there.
+		//
+		// Phaser hits this every frame: it binds its batch as
+		// a0 b0=sky … a5 b5=text2 a6 b6=text3, so the LAST-bound unit (6) was
+		// silently re-pointed at unit 0's texture and the last Text object
+		// rendered as a squashed copy of the sky. Diagnosed 2026-09-13 on the
+		// round-2 14-shipped-game demo, where the ops log showed `b6=t114` and
+		// the census one draw later showed `u6=t108` (the sky).
+		st->user_snap.tex2d_binding = (GLint)tex;
 	}
 }
 FN(w_active_texture) {
@@ -3923,7 +3939,18 @@ FN(w_active_texture) {
 	glActiveTexture(unit);
 	if (st) {
 		st->user_snap.active_tex = (GLint)unit;
-		nx_gl_note_tex_unit((int)unit - (int)GL_TEXTURE0);
+		const int u = (int)unit - (int)GL_TEXTURE0;
+		nx_gl_note_tex_unit(u);
+		// Changing the active unit changes which binding `tex2d_binding`
+		// denotes, so re-point it at that unit's known texture. Without this
+		// an activeTexture() with no following bindTexture() would leave the
+		// field describing the PREVIOUS unit, and restore would stamp the
+		// previous unit's texture onto the new one — the same destructive
+		// shape as the bug fixed in w_bind_texture above, just reached
+		// without a bind.
+		if (u >= 0 && u < NX_GL_MAX_TRACKED_TEX_UNITS) {
+			st->user_snap.tex2d_binding = st->user_snap.tex2d_units[u];
+		}
 	}
 }
 
@@ -4123,6 +4150,72 @@ static inline void bucket_e_translate_tex_sub_image(
 // Non-MVP (HALF_FLOAT/FLOAT source-uploads, OffscreenCanvas-as-source,
 // PBO offset overload) fall through to nullptr → null upload, matching
 // pre-#69 behavior. See ledger #69 for deferral rationale.
+// Expand a planar-I420 nx_image_t into premultiplied BGRA, the layout the
+// (format, type) conversion below assumes for every source.
+//
+// A `<video>` frame decoded on the YUV path (image.h `is_yuv`) stores
+// contiguous Y|U|V at 1.5 B/px — NOT BGRA. canvas.cc's drawImage knows that
+// and builds a GPU YUVA SkImage; this file did not, so
+// `gl.texImage2D(..., videoFrame)` walked `img->data` with a W*4 stride and
+// read W*H*4 bytes out of a W*H*1.5 byte buffer. Two things went wrong at
+// once: the visible texture was the luma plane packed 4 samples to a BGRA
+// pixel (so the frame appeared squashed ~4x horizontally, tiled and sheared,
+// with the chroma planes trailing as a garbage band), and the read ran
+// 2.67x past the end of the allocation. Diagnosed 2026-09-13 on the Phaser
+// round-2 13-video-dom demo; it hits any page that uses a <video> as a WebGL
+// texture source (Three.js VideoTexture, PIXI VideoResource, Phaser Video).
+//
+// Straightforward integer BT.601/709 conversion. The extra full-frame buffer
+// costs ~900 KB at 640x360 and one pass over the pixels; it is only paid by
+// pages that actually upload video frames to GL, and the alternative —
+// keeping the planes on the GPU — would need the page's own shaders to do
+// the YUV->RGB step, which we can't reach.
+static bool expand_yuv_image_to_bgra(const nx_image_t *img,
+                                     std::vector<uint8_t> &out) {
+	const uint32_t W = img->width;
+	const uint32_t H = img->height;
+	const uint32_t CW = (W + 1) / 2;
+	const uint32_t CH = (H + 1) / 2;
+	const uint8_t *Yp = img->data;
+	const uint8_t *Up = Yp + (size_t)W * (size_t)H;
+	const uint8_t *Vp = Up + (size_t)CW * (size_t)CH;
+	// R = (yg*(Y-yoff) + rv*E           + 128) >> 8
+	// G = (yg*(Y-yoff) - gu*D   - gv*E  + 128) >> 8
+	// B = (yg*(Y-yoff) + bu*D           + 128) >> 8   (D = U-128, E = V-128)
+	// Selector matches canvas.cc's SkYUVColorSpace switch on the same tag.
+	int yoff = 16, yg = 298, rv = 459, gu = 55, gv = 136, bu = 541; // 709 ltd
+	switch (img->yuv_colorspace) {
+	case 1: yoff = 16; yg = 298; rv = 409; gu = 100; gv = 208; bu = 516; break;
+	case 2: yoff = 0;  yg = 256; rv = 359; gu = 88;  gv = 183; bu = 454; break;
+	case 3: yoff = 0;  yg = 256; rv = 403; gu = 48;  gv = 120; bu = 475; break;
+	default: break;
+	}
+	out.assign((size_t)W * (size_t)H * 4, 0);
+	uint8_t *dst = out.data();
+	for (uint32_t y = 0; y < H; ++y) {
+		const uint8_t *yrow = Yp + (size_t)y * (size_t)W;
+		const uint8_t *urow = Up + (size_t)(y / 2) * (size_t)CW;
+		const uint8_t *vrow = Vp + (size_t)(y / 2) * (size_t)CW;
+		uint8_t *drow = dst + (size_t)y * (size_t)W * 4;
+		for (uint32_t x = 0; x < W; ++x) {
+			const int c = yg * ((int)yrow[x] - yoff);
+			const int d = (int)urow[x / 2] - 128;
+			const int e = (int)vrow[x / 2] - 128;
+			const int r = (c + rv * e + 128) >> 8;
+			const int g = (c - gu * d - gv * e + 128) >> 8;
+			const int b = (c + bu * d + 128) >> 8;
+			// BGRA byte order, opaque. Alpha 255 means "premultiplied" and
+			// "straight" coincide, so the un-premultiply branch below is a
+			// no-op for video frames either way.
+			drow[x * 4 + 0] = (uint8_t)(b < 0 ? 0 : (b > 255 ? 255 : b));
+			drow[x * 4 + 1] = (uint8_t)(g < 0 ? 0 : (g > 255 ? 255 : g));
+			drow[x * 4 + 2] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+			drow[x * 4 + 3] = 255;
+		}
+	}
+	return true;
+}
+
 static uint8_t *convert_image_source_to_gl_pixels(
     nx_image_t *img, GLenum format, GLenum type,
     bool flip_y, bool un_premultiply,
@@ -4130,6 +4223,14 @@ static uint8_t *convert_image_source_to_gl_pixels(
 	if (!img || !img->data || img->width == 0 || img->height == 0) return nullptr;
 	const uint32_t W = img->width;
 	const uint32_t H = img->height;
+	// Planar-I420 sources get normalised to BGRA first; `src_pixels` is what
+	// the row walk below reads, so every (format, type) case stays untouched.
+	std::vector<uint8_t> yuv_bgra;
+	const uint8_t *src_pixels = img->data;
+	if (img->is_yuv) {
+		if (!expand_yuv_image_to_bgra(img, yuv_bgra)) return nullptr;
+		src_pixels = yuv_bgra.data();
+	}
 	// Bytes per destination pixel for the supported (format, type) matrix.
 	size_t dst_bpp = 0;
 	if (type == GL_UNSIGNED_BYTE) {
@@ -4154,7 +4255,7 @@ static uint8_t *convert_image_source_to_gl_pixels(
 	uint8_t *dst = scratch.data();
 	for (uint32_t y = 0; y < H; ++y) {
 		const uint32_t src_y = flip_y ? (H - 1 - y) : y;
-		const uint8_t *src_row = img->data + (size_t)src_y * (size_t)W * 4;
+		const uint8_t *src_row = src_pixels + (size_t)src_y * (size_t)W * 4;
 		uint8_t *dst_row = dst + (size_t)y * (size_t)W * dst_bpp;
 		for (uint32_t x = 0; x < W; ++x) {
 			// Source is premultiplied BGRA.

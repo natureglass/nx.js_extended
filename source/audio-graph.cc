@@ -6,6 +6,77 @@
 #include <string.h>
 
 namespace {
+constexpr double NX_TWO_PI = 6.283185307179586476925;
+constexpr double NX_PI = 3.141592653589793238463;
+} // namespace
+
+// ---------------------------------------------------------------------------
+// FFT (used by ConvolverNode)
+// ---------------------------------------------------------------------------
+
+void nx_audio_fft::init(uint32_t n) {
+	size = n;
+	uint32_t bits = 0;
+	while ((1u << bits) < n)
+		bits++;
+	rev.resize(n);
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t r = 0;
+		for (uint32_t b = 0; b < bits; b++)
+			if (i & (1u << b))
+				r |= 1u << (bits - 1 - b);
+		rev[i] = r;
+	}
+	tw_cos.resize(n / 2);
+	tw_sin.resize(n / 2);
+	for (uint32_t i = 0; i < n / 2; i++) {
+		double ang = -NX_TWO_PI * (double)i / (double)n;
+		tw_cos[i] = (float)cos(ang);
+		tw_sin[i] = (float)sin(ang);
+	}
+}
+
+void nx_audio_fft::forward(float *re, float *im) const {
+	uint32_t n = size;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t j = rev[i];
+		if (j > i) {
+			std::swap(re[i], re[j]);
+			std::swap(im[i], im[j]);
+		}
+	}
+	for (uint32_t len = 2; len <= n; len <<= 1) {
+		uint32_t half = len >> 1;
+		uint32_t step = n / len;
+		for (uint32_t i = 0; i < n; i += len) {
+			uint32_t k = 0;
+			for (uint32_t j = 0; j < half; j++, k += step) {
+				float wr = tw_cos[k], wi = tw_sin[k];
+				uint32_t a = i + j, b = a + half;
+				float xr = re[b] * wr - im[b] * wi;
+				float xi = re[b] * wi + im[b] * wr;
+				re[b] = re[a] - xr;
+				im[b] = im[a] - xi;
+				re[a] += xr;
+				im[a] += xi;
+			}
+		}
+	}
+}
+
+void nx_audio_fft::inverse(float *re, float *im) const {
+	uint32_t n = size;
+	for (uint32_t i = 0; i < n; i++)
+		im[i] = -im[i];
+	forward(re, im);
+	float scale = 1.f / (float)n;
+	for (uint32_t i = 0; i < n; i++) {
+		re[i] *= scale;
+		im[i] = -im[i] * scale;
+	}
+}
+
+namespace {
 
 constexpr int Q = NX_AUDIO_RENDER_QUANTUM;
 
@@ -207,6 +278,10 @@ void sum_inputs(nx_audio_graph *g, nx_audio_node *n, double t0,
 	memset(in, 0, sizeof(float) * NX_AUDIO_CHANNELS * Q);
 	int ch = 1;
 	for (nx_audio_node *src : n->inputs) {
+		// A permanently-silent input contributes exact zeros forever; skipping
+		// it avoids both rendering it and accumulating a quantum of zeros.
+		if (src->silent)
+			continue;
 		process_node(g, src, t0);
 		for (int c = 0; c < NX_AUDIO_CHANNELS; c++)
 			for (int i = 0; i < Q; i++)
@@ -599,6 +674,360 @@ void process_dynamics_compressor(nx_audio_graph *g, nx_audio_node *n,
 	n->comp_reduction = (float)env;
 }
 
+// BiquadFilterNode: the Audio EQ Cookbook filters, in the exact forms the Web
+// Audio spec prescribes. Writes the five normalised coefficients (already
+// divided by a0) into `b` (b0, b1, b2) and `a` (a1, a2).
+//
+// Two spec quirks worth flagging: `f0` is expressed relative to NYQUIST (so
+// w0 = pi * f0 / nyquist), and for lowpass / highpass only, `Q` is in
+// DECIBELS — a page setting Q = 1 on a lowpass means 1 dB, not a linear 1.
+// The degenerate cases (cutoff at or past DC / Nyquist) are spelled out by the
+// spec too, and matter here: pixi-sound's TelephoneFilter leaves Q at its
+// default, and a badly-behaved filter at the band edges rings or blows up.
+void biquad_coeffs(int type, double sample_rate, double frequency,
+                   double detune, double q, double gain_db, double *b,
+                   double *a) {
+	// Passthrough by default; the degenerate branches below fall back to it.
+	b[0] = 1;
+	b[1] = 0;
+	b[2] = 0;
+	a[0] = 0;
+	a[1] = 0;
+
+	double nyquist = sample_rate * 0.5;
+	double f0 = frequency * pow(2.0, detune / 1200.0);
+	double fn = nyquist > 0 ? f0 / nyquist : 0; // normalised to Nyquist
+	double amp = pow(10.0, gain_db / 40.0);     // shelf / peaking "A"
+
+	if (!(fn > 0)) {
+		// Cutoff at (or below) DC.
+		switch (type) {
+		case NX_AUDIO_BIQUAD_LOWPASS:
+		case NX_AUDIO_BIQUAD_BANDPASS:
+			b[0] = 0; // nothing passes
+			break;
+		case NX_AUDIO_BIQUAD_HIGHSHELF:
+			b[0] = amp * amp; // the whole band is inside the shelf
+			break;
+		default:
+			break; // passthrough
+		}
+		return;
+	}
+	if (fn >= 1) {
+		// Cutoff at (or above) Nyquist.
+		switch (type) {
+		case NX_AUDIO_BIQUAD_HIGHPASS:
+		case NX_AUDIO_BIQUAD_BANDPASS:
+			b[0] = 0;
+			break;
+		case NX_AUDIO_BIQUAD_LOWSHELF:
+			b[0] = amp * amp;
+			break;
+		default:
+			break;
+		}
+		return;
+	}
+
+	double w0 = NX_PI * fn;
+	double cw = cos(w0), sw = sin(w0);
+	double alpha, a0;
+	bool ok = true;
+
+	switch (type) {
+	case NX_AUDIO_BIQUAD_HIGHPASS:
+		alpha = sw / (2.0 * pow(10.0, q / 20.0)); // Q in dB
+		a0 = 1 + alpha;
+		b[0] = ((1 + cw) / 2) / a0;
+		b[1] = (-(1 + cw)) / a0;
+		b[2] = b[0];
+		a[0] = (-2 * cw) / a0;
+		a[1] = (1 - alpha) / a0;
+		break;
+	case NX_AUDIO_BIQUAD_BANDPASS:
+		if (!(q > 0)) { // zero bandwidth -> nothing passes
+			b[0] = 0;
+			break;
+		}
+		alpha = sw / (2.0 * q);
+		a0 = 1 + alpha;
+		b[0] = alpha / a0;
+		b[1] = 0;
+		b[2] = -alpha / a0;
+		a[0] = (-2 * cw) / a0;
+		a[1] = (1 - alpha) / a0;
+		break;
+	case NX_AUDIO_BIQUAD_NOTCH:
+		if (!(q > 0)) // zero bandwidth -> nothing is notched out
+			break;
+		alpha = sw / (2.0 * q);
+		a0 = 1 + alpha;
+		b[0] = 1 / a0;
+		b[1] = (-2 * cw) / a0;
+		b[2] = b[0];
+		a[0] = b[1];
+		a[1] = (1 - alpha) / a0;
+		break;
+	case NX_AUDIO_BIQUAD_ALLPASS:
+		if (!(q > 0)) { // degenerates to a sign flip
+			b[0] = -1;
+			break;
+		}
+		alpha = sw / (2.0 * q);
+		a0 = 1 + alpha;
+		b[0] = (1 - alpha) / a0;
+		b[1] = (-2 * cw) / a0;
+		b[2] = 1; // (1 + alpha) / a0
+		a[0] = b[1];
+		a[1] = b[0];
+		break;
+	case NX_AUDIO_BIQUAD_PEAKING:
+		if (!(q > 0)) { // zero bandwidth -> the peak gain applies everywhere
+			b[0] = amp * amp;
+			break;
+		}
+		alpha = sw / (2.0 * q);
+		a0 = 1 + alpha / amp;
+		b[0] = (1 + alpha * amp) / a0;
+		b[1] = (-2 * cw) / a0;
+		b[2] = (1 - alpha * amp) / a0;
+		a[0] = b[1];
+		a[1] = (1 - alpha / amp) / a0;
+		break;
+	case NX_AUDIO_BIQUAD_LOWSHELF: {
+		// S = 1, so alpha = sin(w0)/2 * sqrt(2), and the cookbook's
+		// 2 * sqrt(A) * alpha collapses to sqrt(2 * A) * sin(w0).
+		double tsa = sqrt(2.0 * amp) * sw;
+		a0 = (amp + 1) + (amp - 1) * cw + tsa;
+		b[0] = (amp * ((amp + 1) - (amp - 1) * cw + tsa)) / a0;
+		b[1] = (2 * amp * ((amp - 1) - (amp + 1) * cw)) / a0;
+		b[2] = (amp * ((amp + 1) - (amp - 1) * cw - tsa)) / a0;
+		a[0] = (-2 * ((amp - 1) + (amp + 1) * cw)) / a0;
+		a[1] = ((amp + 1) + (amp - 1) * cw - tsa) / a0;
+		break;
+	}
+	case NX_AUDIO_BIQUAD_HIGHSHELF: {
+		double tsa = sqrt(2.0 * amp) * sw;
+		a0 = (amp + 1) - (amp - 1) * cw + tsa;
+		b[0] = (amp * ((amp + 1) + (amp - 1) * cw + tsa)) / a0;
+		b[1] = (-2 * amp * ((amp - 1) + (amp + 1) * cw)) / a0;
+		b[2] = (amp * ((amp + 1) + (amp - 1) * cw - tsa)) / a0;
+		a[0] = (2 * ((amp - 1) - (amp + 1) * cw)) / a0;
+		a[1] = ((amp + 1) - (amp - 1) * cw - tsa) / a0;
+		break;
+	}
+	case NX_AUDIO_BIQUAD_LOWPASS:
+	default:
+		alpha = sw / (2.0 * pow(10.0, q / 20.0)); // Q in dB
+		a0 = 1 + alpha;
+		b[0] = ((1 - cw) / 2) / a0;
+		b[1] = (1 - cw) / a0;
+		b[2] = b[0];
+		a[0] = (-2 * cw) / a0;
+		a[1] = (1 - alpha) / a0;
+		break;
+	}
+	// A NaN anywhere (a pathological parameter combination) would latch into
+	// the filter state and silence the node forever — fall back to passthrough.
+	for (int i = 0; i < 3; i++)
+		if (!isfinite(b[i]))
+			ok = false;
+	for (int i = 0; i < 2; i++)
+		if (!isfinite(a[i]))
+			ok = false;
+	if (!ok) {
+		b[0] = 1;
+		b[1] = b[2] = a[0] = a[1] = 0;
+	}
+}
+
+// BiquadFilterNode. Coefficients are recomputed once per render quantum
+// (k-rate) — a filter sweep automated at audio rate steps every 2.7 ms rather
+// than every sample, which is inaudible at the usual envelope / LFO speeds.
+// Each channel keeps its own direct-form-I history across quanta.
+void process_biquad(nx_audio_graph *g, nx_audio_node *n, double t0) {
+	float in[NX_AUDIO_CHANNELS][Q];
+	int ch;
+	sum_inputs(g, n, t0, in, &ch);
+	n->bus_ch = ch;
+
+	double b[3], a[2];
+	biquad_coeffs(n->biquad_type, g->sample_rate,
+	              param_value_at(&n->params[0], t0), // frequency
+	              param_value_at(&n->params[1], t0), // detune
+	              param_value_at(&n->params[2], t0), // Q
+	              param_value_at(&n->params[3], t0), // gain (dB)
+	              b, a);
+
+	for (int c = 0; c < NX_AUDIO_CHANNELS; c++) {
+		double x1 = n->biquad_x1[c], x2 = n->biquad_x2[c];
+		double y1 = n->biquad_y1[c], y2 = n->biquad_y2[c];
+		for (int i = 0; i < Q; i++) {
+			double x = in[c][i];
+			double y = b[0] * x + b[1] * x1 + b[2] * x2 - a[0] * y1 - a[1] * y2;
+			x2 = x1;
+			x1 = x;
+			y2 = y1;
+			y1 = y;
+			n->bus[c][i] = (float)y;
+		}
+		// Reset a state that has gone non-finite (it would otherwise poison
+		// every later sample) or decayed into denormals (which trap).
+		if (!isfinite(y1) || !isfinite(y2)) {
+			x1 = x2 = y1 = y2 = 0;
+			for (int i = 0; i < Q; i++)
+				if (!isfinite(n->bus[c][i]))
+					n->bus[c][i] = 0.f;
+		} else if (fabs(y1) + fabs(y2) + fabs(x1) + fabs(x2) < 1e-25) {
+			x1 = x2 = y1 = y2 = 0;
+		}
+		n->biquad_x1[c] = x1;
+		n->biquad_x2[c] = x2;
+		n->biquad_y1[c] = y1;
+		n->biquad_y2[c] = y2;
+	}
+}
+
+// Transforms the just-completed input window and convolves it against every
+// partition of the impulse response, leaving the next block of output in
+// `conv_out`. Overlap-save: the window is [previous block | current block], the
+// impulse partitions are zero-padded to the same length, and only the second
+// half of the inverse transform — the half free of circular wrap-around — is
+// true linear convolution, so only that half is kept.
+void convolver_process_block(nx_audio_node *n, const nx_audio_convolver_ir *ir,
+                             bool window_zero) {
+	const uint32_t N = ir->fft_size, B = ir->block, bins = ir->bins,
+	               K = ir->partitions;
+	n->conv_fdl_slot = (n->conv_fdl_slot + 1) % K;
+	n->conv_fdl_zero[n->conv_fdl_slot] = window_zero ? 1 : 0;
+	float *re = n->conv_scratch_re.data();
+	float *im = n->conv_scratch_im.data();
+	float *ar = n->conv_acc_re.data();
+	float *ai = n->conv_acc_im.data();
+
+	for (int c = 0; c < NX_AUDIO_CHANNELS; c++) {
+		float *slot =
+		    n->conv_fdl[c].data() + (size_t)n->conv_fdl_slot * bins * 2;
+		if (window_zero) {
+			// Transforming silence just produces zeros — skip the work.
+			memset(slot, 0, (size_t)bins * 2 * sizeof(float));
+		} else {
+			const float *win = n->conv_in[c].data();
+			for (uint32_t i = 0; i < N; i++) {
+				re[i] = win[i];
+				im[i] = 0.f;
+			}
+			ir->fft.forward(re, im);
+			for (uint32_t i = 0; i < bins; i++) {
+				slot[i * 2] = re[i];
+				slot[i * 2 + 1] = im[i];
+			}
+		}
+
+		memset(ar, 0, (size_t)bins * sizeof(float));
+		memset(ai, 0, (size_t)bins * sizeof(float));
+		// Partition k convolves against the input window from k blocks ago.
+		const float *spec = ir->spectra[ir->channels == 2 ? c : 0].data();
+		for (uint32_t k = 0; k < K; k++) {
+			uint32_t s = (n->conv_fdl_slot + K - k) % K;
+			if (n->conv_fdl_zero[s])
+				continue; // silence convolves to silence
+			const float *fd = n->conv_fdl[c].data() + (size_t)s * bins * 2;
+			const float *hp = spec + (size_t)k * bins * 2;
+			for (uint32_t i = 0; i < bins; i++) {
+				float xr = fd[i * 2], xi = fd[i * 2 + 1];
+				float hr = hp[i * 2], hi = hp[i * 2 + 1];
+				ar[i] += xr * hr - xi * hi;
+				ai[i] += xr * hi + xi * hr;
+			}
+		}
+
+		// The accumulated half-spectrum is Hermitian (both operands came from
+		// real signals) — mirror it back to full length for the inverse.
+		for (uint32_t i = 0; i < bins; i++) {
+			re[i] = ar[i];
+			im[i] = ai[i];
+		}
+		for (uint32_t i = bins; i < N; i++) {
+			re[i] = ar[N - i];
+			im[i] = -ai[N - i];
+		}
+		ir->fft.inverse(re, im);
+		memcpy(n->conv_out[c].data(), re + B, (size_t)B * sizeof(float));
+	}
+}
+
+// ConvolverNode. The node is block-based while the graph is quantum-based, so
+// each quantum emits Q frames of the block computed at the last block boundary
+// and appends Q frames of input; every `block / Q` quanta a new output block is
+// produced. That is exactly where the node's latency comes from: one partition.
+void process_convolver(nx_audio_graph *g, nx_audio_node *n, double t0) {
+	std::shared_ptr<nx_audio_convolver_ir> ir = n->conv_ir;
+	float in[NX_AUDIO_CHANNELS][Q];
+	int ch;
+	if (!ir || ir->partitions == 0 || n->conv_out[0].empty()) {
+		// No impulse response set: the spec says the node outputs silence.
+		// Inputs are still pulled so upstream sources advance their playheads.
+		sum_inputs(g, n, t0, in, &ch);
+		zero_bus(n);
+		n->bus_ch = 1;
+		return;
+	}
+	const uint32_t B = ir->block;
+
+	for (int c = 0; c < NX_AUDIO_CHANNELS; c++)
+		memcpy(n->bus[c], n->conv_out[c].data() + n->conv_out_pos,
+		       (size_t)Q * sizeof(float));
+	n->bus_ch = n->conv_out_ch;
+	n->conv_out_pos += Q;
+
+	sum_inputs(g, n, t0, in, &ch);
+	for (int c = 0; c < NX_AUDIO_CHANNELS; c++)
+		memcpy(n->conv_in[c].data() + B + n->conv_fill, in[c],
+		       (size_t)Q * sizeof(float));
+	n->conv_fill += Q;
+	if (n->conv_fill < B)
+		return;
+
+	// Track runs of silent input. Once the run is longer than the delay line,
+	// every stored spectrum is zero, so the reverb tail has fully decayed and
+	// there is nothing left to compute until signal returns — which matters,
+	// because a convolver left connected to a quiet bus would otherwise burn
+	// its full cost forever.
+	bool zero = true;
+	for (int c = 0; c < NX_AUDIO_CHANNELS && zero; c++) {
+		const float *cur = n->conv_in[c].data() + B;
+		for (uint32_t i = 0; i < B; i++) {
+			if (cur[i] != 0.f) {
+				zero = false;
+				break;
+			}
+		}
+	}
+	if (!zero)
+		n->conv_zero_blocks = 0;
+	else if (n->conv_zero_blocks <= ir->partitions)
+		n->conv_zero_blocks++;
+
+	if (n->conv_zero_blocks > ir->partitions) {
+		for (int c = 0; c < NX_AUDIO_CHANNELS; c++)
+			memset(n->conv_out[c].data(), 0, (size_t)B * sizeof(float));
+	} else {
+		// The overlap-save window spans this block and the previous one, so it
+		// is only silent if both were.
+		convolver_process_block(n, ir.get(), zero && n->conv_prev_zero);
+	}
+	n->conv_prev_zero = zero;
+	n->conv_out_ch = ir->channels == 2 ? 2 : ch;
+	n->conv_fill = 0;
+	n->conv_out_pos = 0;
+	// The block just consumed becomes the overlap for the next one.
+	for (int c = 0; c < NX_AUDIO_CHANNELS; c++)
+		memmove(n->conv_in[c].data(), n->conv_in[c].data() + B,
+		        (size_t)B * sizeof(float));
+}
+
 void process_node(nx_audio_graph *g, nx_audio_node *n, double t0) {
 	if (n->processed_quantum == g->quantum_id)
 		return; // already rendered this quantum (fan-out memoization)
@@ -639,9 +1068,67 @@ void process_node(nx_audio_graph *g, nx_audio_node *n, double t0) {
 	case NX_AUDIO_NODE_DYNAMICS_COMPRESSOR:
 		process_dynamics_compressor(g, n, t0);
 		break;
+	case NX_AUDIO_NODE_BIQUAD_FILTER:
+		process_biquad(g, n, t0);
+		break;
+	case NX_AUDIO_NODE_CONVOLVER:
+		process_convolver(g, n, t0);
+		break;
 	}
 	n->processing = false;
 	n->processed_quantum = g->quantum_id;
+}
+
+// Marks nodes that can never produce signal again. A source that has finished
+// playing is silent forever (Web Audio lets the implementation drop it from the
+// rendering graph at that point — Chrome disconnects it immediately rather than
+// waiting for the wrapper to be collected). Silence then propagates through
+// pure multiplicative nodes: a gain or panner whose every input is permanently
+// silent outputs exact zeros regardless of its own parameter value.
+//
+// Without this, a fire-and-forget app (one oscillator+gain per tracker row, the
+// standard Web Audio idiom) keeps every note it has ever played in the render
+// walk, so per-quantum cost grows without bound.
+bool mark_silent(nx_audio_node *n) {
+	if (n->silent)
+		return true;
+	if (n->silent_checking)
+		return false; // in a cycle — assume live
+	switch (n->type) {
+	case NX_AUDIO_NODE_OSCILLATOR:
+	case NX_AUDIO_NODE_BUFFER_SOURCE:
+		if (!n->started || n->playback_state != NX_AUDIO_SOURCE_FINISHED)
+			return false;
+		break;
+	case NX_AUDIO_NODE_GAIN:
+	case NX_AUDIO_NODE_STEREO_PANNER: {
+		if (n->inputs.empty())
+			return false; // may still be connected to later
+		n->silent_checking = true;
+		bool all = true;
+		for (nx_audio_node *src : n->inputs) {
+			if (!mark_silent(src)) {
+				all = false;
+				break;
+			}
+		}
+		n->silent_checking = false;
+		if (!all)
+			return false;
+		break;
+	}
+	default:
+		// Destination, analyser, delay (tail), compressor (envelope state) and
+		// the media stream source are never declared permanently silent.
+		return false;
+	}
+	n->silent = true;
+	zero_bus(n);
+	// The edges are deliberately left in place: a per-voice gain that the app
+	// reuses (connect it to the destination once, feed it a new source per
+	// note) must stay wired up. `sum_inputs` skips silent inputs by flag, and
+	// `nx_audio_node_connect` clears the flag when signal can flow again.
+	return true;
 }
 
 // Renders one 128-frame quantum into the destination bus and advances time.
@@ -653,14 +1140,21 @@ void render_quantum(nx_audio_graph *g) {
 	// stay bounded no matter how much automation was scheduled. Events in
 	// (t0, t0 + Q/sr) are in the future relative to t0 and are retained, so
 	// this quantum's evaluation is unaffected.
-	for (nx_audio_node *n : g->nodes)
+	for (nx_audio_node *n : g->nodes) {
+		if (n->silent)
+			continue;
+		mark_silent(n);
+		if (n->silent)
+			continue;
 		for (nx_audio_param &p : n->params)
 			param_prune(&p, t0);
+	}
 	process_node(g, g->destination, t0);
 	// Sources not reachable from the destination still progress through their
 	// schedule (so `ended` fires even for unconnected/indirect sources).
 	for (nx_audio_node *n : g->nodes) {
-		if ((n->type == NX_AUDIO_NODE_BUFFER_SOURCE ||
+		if (!n->silent &&
+		    (n->type == NX_AUDIO_NODE_BUFFER_SOURCE ||
 		     n->type == NX_AUDIO_NODE_OSCILLATOR) &&
 		    n->processed_quantum != g->quantum_id)
 			process_node(g, n, t0);
@@ -798,11 +1292,47 @@ nx_audio_node *node_new(nx_audio_graph *g, nx_audio_node_type type,
 		n->params.push_back(release);
 		break;
 	}
+	case NX_AUDIO_NODE_BIQUAD_FILTER: {
+		// frequency (Hz), detune (cents), Q, gain (dB) — spec defaults.
+		nx_audio_param frequency;
+		frequency.value = 350.f;
+		frequency.min_value = 0.f;
+		frequency.max_value = (float)(g->sample_rate * 0.5);
+		n->params.push_back(frequency);
+		nx_audio_param detune;
+		detune.value = 0.f;
+		detune.min_value = -153600.f;
+		detune.max_value = 153600.f;
+		n->params.push_back(detune);
+		nx_audio_param qp;
+		qp.value = 1.f;
+		n->params.push_back(qp);
+		nx_audio_param gain;
+		gain.value = 0.f;
+		n->params.push_back(gain);
+		break;
+	}
+	case NX_AUDIO_NODE_CONVOLVER:
+		// No params, and no buffers until an impulse response is assigned —
+		// until then the node renders silence.
+		break;
 	case NX_AUDIO_NODE_DESTINATION:
 		break;
 	}
 	g->nodes.push_back(n);
 	return n;
+}
+
+// Clears the permanently-silent flag on `n` and everything downstream of it.
+// Called when a new input is connected, which can make a previously dead
+// sub-graph carry signal again. Guarded against fan-in revisits and cycles by
+// stopping as soon as a node is already clear.
+void clear_silent_downstream(nx_audio_node *n) {
+	if (!n || !n->silent)
+		return;
+	n->silent = false;
+	for (nx_audio_node *dst : n->outputs)
+		clear_silent_downstream(dst);
 }
 
 } // namespace
@@ -872,6 +1402,10 @@ void nx_audio_node_connect(nx_audio_node *src, nx_audio_node *dst) {
 		return;
 	dst->inputs.push_back(src);
 	src->outputs.push_back(dst);
+	// A node that was declared permanently silent can carry signal again once
+	// something is connected into it (the common "reuse one voice gain per
+	// note" idiom). Clear the flag over the whole downstream cone.
+	clear_silent_downstream(dst);
 }
 
 void nx_audio_node_disconnect(nx_audio_node *src, nx_audio_node *dst) {
@@ -1005,6 +1539,258 @@ int nx_audio_source_playback_state(nx_audio_node *n) {
 void nx_audio_oscillator_set_type(nx_audio_node *n, int type) {
 	std::lock_guard<std::mutex> lock(n->graph->mutex);
 	n->oscillator_type = type;
+}
+
+// ---------------------------------------------------------------------------
+// BiquadFilterNode
+// ---------------------------------------------------------------------------
+
+void nx_audio_biquad_set_type(nx_audio_node *n, int type) {
+	std::lock_guard<std::mutex> lock(n->graph->mutex);
+	if (n->type != NX_AUDIO_NODE_BIQUAD_FILTER)
+		return;
+	if (type < NX_AUDIO_BIQUAD_LOWPASS || type > NX_AUDIO_BIQUAD_ALLPASS)
+		return;
+	if (n->biquad_type == type)
+		return;
+	n->biquad_type = type;
+	// The history belongs to the old transfer function; carrying it into a
+	// different filter shape is what makes a live `filter.type = ...` switch
+	// pop or, with a high-Q filter, ring.
+	for (int c = 0; c < NX_AUDIO_CHANNELS; c++) {
+		n->biquad_x1[c] = n->biquad_x2[c] = 0;
+		n->biquad_y1[c] = n->biquad_y2[c] = 0;
+	}
+}
+
+void nx_audio_biquad_frequency_response(nx_audio_node *n,
+                                        const float *frequency_hz,
+                                        float *mag_response,
+                                        float *phase_response, uint32_t count) {
+	std::lock_guard<std::mutex> lock(n->graph->mutex);
+	// The param reads below are positional — refuse anything but a biquad.
+	if (n->type != NX_AUDIO_NODE_BIQUAD_FILTER || n->params.size() < 4) {
+		for (uint32_t i = 0; i < count; i++)
+			mag_response[i] = phase_response[i] = 0.f;
+		return;
+	}
+	double t0 = (double)n->graph->frames_rendered / n->graph->sample_rate;
+	double b[3], a[2];
+	biquad_coeffs(n->biquad_type, n->graph->sample_rate,
+	              param_value_at(&n->params[0], t0),
+	              param_value_at(&n->params[1], t0),
+	              param_value_at(&n->params[2], t0),
+	              param_value_at(&n->params[3], t0), b, a);
+	double nyquist = n->graph->sample_rate * 0.5;
+	for (uint32_t i = 0; i < count; i++) {
+		double f = frequency_hz[i];
+		if (!(f >= 0) || f > nyquist) {
+			// Per spec, a frequency outside [0, Nyquist] yields NaN.
+			mag_response[i] = (float)NAN;
+			phase_response[i] = (float)NAN;
+			continue;
+		}
+		// H(e^jw) = (b0 + b1 z^-1 + b2 z^-2) / (1 + a1 z^-1 + a2 z^-2)
+		double w = NX_PI * (nyquist > 0 ? f / nyquist : 0);
+		double c1 = cos(w), s1 = sin(w);
+		double c2 = cos(2 * w), s2 = sin(2 * w);
+		double nr = b[0] + b[1] * c1 + b[2] * c2;
+		double ni = -(b[1] * s1 + b[2] * s2);
+		double dr = 1 + a[0] * c1 + a[1] * c2;
+		double di = -(a[0] * s1 + a[1] * s2);
+		double den = dr * dr + di * di;
+		if (den <= 0) {
+			mag_response[i] = (float)INFINITY;
+			phase_response[i] = 0.f;
+			continue;
+		}
+		double hr = (nr * dr + ni * di) / den;
+		double hi = (ni * dr - nr * di) / den;
+		mag_response[i] = (float)sqrt(hr * hr + hi * hi);
+		phase_response[i] = (float)atan2(hi, hr);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ConvolverNode
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The spec's normalisation: scale the response so that swapping a convolver in
+// does not change perceived loudness. The constants are the ones every engine
+// uses (they come from the reference implementation) — an RMS normalisation
+// with a fixed calibration gain, referenced to 44.1 kHz.
+float convolver_normalization_scale(const std::vector<float> *channels,
+                                    int num_channels, uint32_t length,
+                                    double sample_rate) {
+	constexpr double GAIN_CALIBRATION = 0.00125;
+	constexpr double GAIN_CALIBRATION_SAMPLE_RATE = 44100;
+	constexpr double MIN_POWER = 0.000125;
+	if (num_channels <= 0 || length == 0)
+		return 1.f;
+	double power = 0;
+	for (int c = 0; c < num_channels; c++) {
+		const float *d = channels[c].data();
+		double cp = 0;
+		for (uint32_t i = 0; i < length; i++)
+			cp += (double)d[i] * (double)d[i];
+		power += cp;
+	}
+	power = sqrt(power / ((double)num_channels * (double)length));
+	if (!isfinite(power) || power < MIN_POWER)
+		power = MIN_POWER;
+	double scale = GAIN_CALIBRATION / power;
+	if (sample_rate > 0)
+		scale *= GAIN_CALIBRATION_SAMPLE_RATE / sample_rate;
+	return (float)scale;
+}
+
+// Everything a ConvolverNode needs for a new impulse response, built off the
+// graph mutex (transforming a multi-second response is tens of milliseconds of
+// work — far too long to hold up the render thread) and then moved in wholesale.
+struct convolver_state {
+	std::shared_ptr<nx_audio_convolver_ir> ir;
+	std::vector<float> in[NX_AUDIO_CHANNELS];
+	std::vector<float> out[NX_AUDIO_CHANNELS];
+	std::vector<float> fdl[NX_AUDIO_CHANNELS];
+	std::vector<uint8_t> fdl_zero;
+	std::vector<float> scratch_re, scratch_im, acc_re, acc_im;
+};
+
+void build_convolver_state(convolver_state *st, const float *const *channels,
+                           int num_channels, uint32_t length,
+                           double sample_rate, double graph_rate,
+                           bool normalize) {
+	// A 4-channel ("true stereo") response is matrixed down to its first two
+	// channels; anything beyond two is otherwise ignored.
+	int nch = num_channels >= 2 ? 2 : 1;
+
+	// Resample to the graph rate if the page handed us a buffer recorded at a
+	// different one, then truncate to the memory cap.
+	std::vector<float> data[NX_AUDIO_CHANNELS];
+	uint32_t len = length;
+	bool resample = sample_rate > 0 && graph_rate > 0 &&
+	                fabs(sample_rate - graph_rate) > 1e-6;
+	if (resample) {
+		double ratio = graph_rate / sample_rate;
+		uint64_t want = (uint64_t)((double)length * ratio);
+		len = (uint32_t)(want > 0 ? want : 1);
+	}
+	uint32_t max_len = (uint32_t)(graph_rate * NX_AUDIO_CONVOLVER_MAX_SECONDS);
+	if (max_len > 0 && len > max_len)
+		len = max_len;
+	for (int c = 0; c < nch; c++) {
+		data[c].resize(len);
+		const float *src = channels[c];
+		if (!resample) {
+			for (uint32_t i = 0; i < len && i < length; i++)
+				data[c][i] = src[i];
+		} else {
+			double step = sample_rate / graph_rate;
+			for (uint32_t i = 0; i < len; i++) {
+				double pos = (double)i * step;
+				uint32_t i0 = (uint32_t)pos;
+				if (i0 >= length) {
+					data[c][i] = 0.f;
+					continue;
+				}
+				uint32_t i1 = i0 + 1 < length ? i0 + 1 : i0;
+				double frac = pos - (double)i0;
+				data[c][i] = (float)(src[i0] + (src[i1] - src[i0]) * frac);
+			}
+		}
+	}
+
+	float scale =
+	    normalize ? convolver_normalization_scale(data, nch, len, sample_rate)
+	              : 1.f;
+
+	auto ir = std::make_shared<nx_audio_convolver_ir>();
+	ir->block = NX_AUDIO_CONVOLVER_BLOCK;
+	ir->fft_size = ir->block * 2;
+	ir->bins = ir->fft_size / 2 + 1;
+	ir->partitions = (len + ir->block - 1) / ir->block;
+	if (ir->partitions == 0)
+		ir->partitions = 1;
+	ir->channels = nch;
+	ir->fft.init(ir->fft_size);
+
+	std::vector<float> re(ir->fft_size), im(ir->fft_size);
+	for (int c = 0; c < nch; c++) {
+		ir->spectra[c].assign((size_t)ir->partitions * ir->bins * 2, 0.f);
+		for (uint32_t k = 0; k < ir->partitions; k++) {
+			// Partition k, zero-padded to the full transform length: the
+			// padding is what turns the circular product back into a linear
+			// convolution over the kept half.
+			uint32_t off = k * ir->block;
+			for (uint32_t i = 0; i < ir->fft_size; i++) {
+				uint32_t j = off + i;
+				re[i] = (i < ir->block && j < len) ? data[c][j] * scale : 0.f;
+				im[i] = 0.f;
+			}
+			ir->fft.forward(re.data(), im.data());
+			float *dst = ir->spectra[c].data() + (size_t)k * ir->bins * 2;
+			for (uint32_t i = 0; i < ir->bins; i++) {
+				dst[i * 2] = re[i];
+				dst[i * 2 + 1] = im[i];
+			}
+		}
+	}
+
+	for (int c = 0; c < NX_AUDIO_CHANNELS; c++) {
+		st->in[c].assign(ir->fft_size, 0.f);
+		st->out[c].assign(ir->block, 0.f);
+		st->fdl[c].assign((size_t)ir->partitions * ir->bins * 2, 0.f);
+	}
+	// Every slot starts as a (zero) silent spectrum.
+	st->fdl_zero.assign(ir->partitions, 1);
+	st->scratch_re.assign(ir->fft_size, 0.f);
+	st->scratch_im.assign(ir->fft_size, 0.f);
+	st->acc_re.assign(ir->bins, 0.f);
+	st->acc_im.assign(ir->bins, 0.f);
+	st->ir = std::move(ir);
+}
+
+} // namespace
+
+void nx_audio_convolver_set_buffer(nx_audio_node *n,
+                                   const float *const *channels,
+                                   int num_channels, uint32_t length,
+                                   double sample_rate, bool normalize) {
+	nx_audio_graph *g = n->graph;
+	double graph_rate;
+	{
+		std::lock_guard<std::mutex> lock(g->mutex);
+		if (n->type != NX_AUDIO_NODE_CONVOLVER)
+			return;
+		graph_rate = g->sample_rate;
+	}
+
+	convolver_state st;
+	if (channels && num_channels > 0 && length > 0 && sample_rate > 0) {
+		build_convolver_state(&st, channels, num_channels, length, sample_rate,
+		                      graph_rate, normalize);
+	}
+
+	std::lock_guard<std::mutex> lock(g->mutex);
+	n->conv_ir = std::move(st.ir);
+	for (int c = 0; c < NX_AUDIO_CHANNELS; c++) {
+		n->conv_in[c] = std::move(st.in[c]);
+		n->conv_out[c] = std::move(st.out[c]);
+		n->conv_fdl[c] = std::move(st.fdl[c]);
+	}
+	n->conv_fdl_zero = std::move(st.fdl_zero);
+	n->conv_scratch_re = std::move(st.scratch_re);
+	n->conv_scratch_im = std::move(st.scratch_im);
+	n->conv_acc_re = std::move(st.acc_re);
+	n->conv_acc_im = std::move(st.acc_im);
+	n->conv_fdl_slot = 0;
+	n->conv_fill = 0;
+	n->conv_out_pos = 0;
+	n->conv_zero_blocks = 0;
+	n->conv_prev_zero = true;
+	n->conv_out_ch = 1;
 }
 
 float nx_audio_compressor_reduction(nx_audio_node *n) {

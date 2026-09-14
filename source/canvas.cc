@@ -1800,9 +1800,15 @@ void nx_canvas_context_2d_measure_text(
 		metrics->Set(jsctx, nx_str(iso, k), Number::New(iso, v)).Check();
 	};
 	double width = 0;
+	// Ink extents of the shaped run, in Skia's y-down space (fTop is NEGATIVE
+	// above the alphabetic baseline). Left at 0 for an empty or whitespace-only
+	// string, which is what the spec asks for.
+	bool have_ink = false;
+	double ink_top = 0, ink_bottom = 0, ink_left = 0, ink_right = 0;
 	// Pin the shared ft_face / hb_font scale to this ctx's font_size before
 	// shaping — see the matching call in fill_text for the rationale.
 	set_font_size(context, context->state->font_size);
+	SkFont font = current_font(context, context->state->font_size);
 	if (context->state->hb_font) {
 		String::Utf8Value text(iso, info[0]);
 		hb_buffer_t *buf = hb_buffer_create();
@@ -1812,23 +1818,62 @@ void nx_canvas_context_2d_measure_text(
 		hb_buffer_add_utf8(buf, *text ? *text : "", -1, 0, -1);
 		hb_shape(context->state->hb_font, buf, NULL, 0);
 		unsigned int glyph_count = hb_buffer_get_length(buf);
+		hb_glyph_info_t *gi = hb_buffer_get_glyph_infos(buf, NULL);
 		hb_glyph_position_t *gp = hb_buffer_get_glyph_positions(buf, NULL);
-		for (unsigned int i = 0; i < glyph_count; ++i)
+		for (unsigned int i = 0; i < glyph_count; ++i) {
+			// Union each glyph's outline box, translated to its pen position,
+			// so `actualBoundingBox*` describes the INK of this exact string
+			// (ascenders, descenders, accents) rather than the font's design
+			// box. Whitespace glyphs have an empty box and are skipped.
+			SkRect b = font.getBounds((SkGlyphID)gi[i].codepoint, nullptr);
+			if (!b.isEmpty()) {
+				double x = width + gp[i].x_offset / 64.0;
+				double l = b.fLeft + x, r = b.fRight + x;
+				if (!have_ink) {
+					ink_top = b.fTop;
+					ink_bottom = b.fBottom;
+					ink_left = l;
+					ink_right = r;
+					have_ink = true;
+				} else {
+					if (b.fTop < ink_top) ink_top = b.fTop;
+					if (b.fBottom > ink_bottom) ink_bottom = b.fBottom;
+					if (l < ink_left) ink_left = l;
+					if (r > ink_right) ink_right = r;
+				}
+			}
 			width += gp[i].x_advance / 64.0;
+		}
 		hb_buffer_destroy(buf);
 	}
+	// Vertical metrics were hard-zeroed here until 2026-09-13, which silently
+	// broke every canvas text layout that asks the browser how tall a line is.
+	// Phaser's `MeasureText` takes the
+	// `if ('actualBoundingBoxAscent' in metrics)` branch — the key EXISTED, so
+	// it trusted the zeros — and derived `fontSize = ascent + descent = 0`.
+	// Its Text objects then laid every wrapped line on the same baseline and
+	// sized their texture canvas to ~0 px tall, so multi-line strings
+	// overprinted and single lines were clipped or vanished entirely
+	// (phasercompatibilitydemos 02-text). Skia has all of this already.
+	SkFontMetrics fm;
+	font.getMetrics(&fm);
 	set0("width", width);
-	set0("actualBoundingBoxLeft", 0);
-	set0("actualBoundingBoxRight", 0);
-	set0("fontBoundingBoxAscent", 0);
-	set0("fontBoundingBoxDescent", 0);
-	set0("actualBoundingBoxAscent", 0);
-	set0("actualBoundingBoxDescent", 0);
-	set0("emHeightAscent", 0);
-	set0("emHeightDescent", 0);
-	set0("hangingBaseline", 0);
+	// `fAscent` is negative (above the baseline); the spec's ascent is positive.
+	set0("actualBoundingBoxAscent", have_ink ? -ink_top : 0.0);
+	set0("actualBoundingBoxDescent", have_ink ? ink_bottom : 0.0);
+	// Distances from the alignment point: LEFT is positive leftwards, which is
+	// why it is negated. Both are measured from x = 0 (left/alphabetic
+	// alignment); `textAlign` offsets are applied by fill_text, not here.
+	set0("actualBoundingBoxLeft", have_ink ? -ink_left : 0.0);
+	set0("actualBoundingBoxRight", have_ink ? ink_right : 0.0);
+	// Font-wide box — independent of the measured string.
+	set0("fontBoundingBoxAscent", -fm.fAscent);
+	set0("fontBoundingBoxDescent", fm.fDescent);
+	set0("emHeightAscent", -fm.fAscent);
+	set0("emHeightDescent", fm.fDescent);
+	set0("hangingBaseline", 0.8 * -fm.fAscent);
 	set0("alphabeticBaseline", 0);
-	set0("ideographicBaseline", 0);
+	set0("ideographicBaseline", -fm.fDescent);
 	info.GetReturnValue().Set(metrics);
 }
 

@@ -1344,8 +1344,8 @@ int64_t mem_seek_cb(void *opaque, int64_t offset, int whence) {
 bool nx_media_decode_audio(const uint8_t *data, size_t size,
                            float *channels[NX_MEDIA_MAX_CHANNELS],
                            int *num_channels, uint32_t *length,
-                           uint32_t *sample_rate, char *errbuf,
-                           size_t errbuf_size) {
+                           uint32_t *sample_rate, uint32_t target_rate,
+                           char *errbuf, size_t errbuf_size) {
 	mem_reader reader = {data, size, 0};
 	AVIOContext *avio = NULL;
 	AVFormatContext *fmt = NULL;
@@ -1358,6 +1358,12 @@ bool nx_media_decode_audio(const uint8_t *data, size_t size,
 	int ret = 0;
 	int nch = 0;
 	bool ok = false;
+	// Resampler state, hoisted so the post-loop flush can see it (the
+	// filter holds a tail of samples that only come out on a NULL-input
+	// convert — dropping it would clip the end of every decoded sound).
+	int src_rate = 0;  // the file's rate
+	int out_rate = 0;  // what we hand back (target_rate, or src_rate)
+	int src_nch = 0;   // channels in the decoded frames
 	// Planar accumulation buffers (resized as frames arrive).
 	std::vector<std::vector<float>> acc;
 	std::vector<float> scratch;
@@ -1444,25 +1450,38 @@ bool nx_media_decode_audio(const uint8_t *data, size_t size,
 					snprintf(errbuf, errbuf_size, "no audio channels");
 					goto done;
 				}
-				*sample_rate = (uint32_t)frame->sample_rate;
+				src_rate = frame->sample_rate;
+				out_rate = target_rate > 0 ? (int)target_rate : src_rate;
+				src_nch = frame->ch_layout.nb_channels;
+				*sample_rate = (uint32_t)out_rate;
 				acc.resize((size_t)nch);
-				// Convert to interleaved f32 at the native rate/layout —
-				// deinterleave below (swr output layout = input layout).
+				// Convert to interleaved f32 at `out_rate`, keeping the
+				// input channel layout (we deinterleave below). When
+				// out_rate != src_rate this is where the actual sample-rate
+				// conversion happens — swr's default polyphase resampler,
+				// once per file, instead of per-sample linear interpolation
+				// on every playback (see the header comment).
 				ret = swr_alloc_set_opts2(
-				    &swr, &frame->ch_layout, AV_SAMPLE_FMT_FLT,
-				    frame->sample_rate, &frame->ch_layout,
-				    (AVSampleFormat)frame->format, frame->sample_rate, 0,
-				    NULL);
+				    &swr, &frame->ch_layout, AV_SAMPLE_FMT_FLT, out_rate,
+				    &frame->ch_layout, (AVSampleFormat)frame->format,
+				    src_rate, 0, NULL);
 				if (ret < 0 || swr_init(swr) < 0) {
 					snprintf(errbuf, errbuf_size,
 					         "failed to create resampler");
 					goto done;
 				}
 			}
-			int src_nch = frame->ch_layout.nb_channels;
-			scratch.resize((size_t)frame->nb_samples * src_nch);
+			// Output capacity must account for BOTH the rate change and
+			// whatever the filter is still holding, or swr silently drops
+			// samples it had no room to write.
+			int out_cap = (int)av_rescale_rnd(
+			    swr_get_delay(swr, src_rate) + frame->nb_samples, out_rate,
+			    src_rate, AV_ROUND_UP);
+			if (out_cap < 1)
+				out_cap = 1;
+			scratch.resize((size_t)out_cap * src_nch);
 			uint8_t *out_ptr = (uint8_t *)scratch.data();
-			int got = swr_convert(swr, &out_ptr, frame->nb_samples,
+			int got = swr_convert(swr, &out_ptr, out_cap,
 			                      (const uint8_t **)frame->extended_data,
 			                      frame->nb_samples);
 			if (got > 0) {
@@ -1478,6 +1497,33 @@ bool nx_media_decode_audio(const uint8_t *data, size_t size,
 		}
 		if (at_eof)
 			break;
+	}
+
+	// Drain the resampler. A polyphase filter runs behind its input by half
+	// its kernel, so the last few ms of every sound live inside swr until a
+	// NULL-input convert pushes them out. Without this a resampled one-shot
+	// loses its tail — quiet, but it turns a decaying sample into a clipped
+	// one. No-op when out_rate == src_rate (swr has nothing buffered).
+	if (swr && src_nch > 0) {
+		while (true) {
+			int out_cap = (int)av_rescale_rnd(swr_get_delay(swr, src_rate),
+			                                  out_rate, src_rate,
+			                                  AV_ROUND_UP);
+			if (out_cap <= 0)
+				break;
+			scratch.resize((size_t)out_cap * src_nch);
+			uint8_t *out_ptr = (uint8_t *)scratch.data();
+			int got = swr_convert(swr, &out_ptr, out_cap, NULL, 0);
+			if (got <= 0)
+				break;
+			for (int c = 0; c < nch; c++) {
+				std::vector<float> &dst = acc[(size_t)c];
+				size_t off = dst.size();
+				dst.resize(off + (size_t)got);
+				for (int i = 0; i < got; i++)
+					dst[off + i] = scratch[(size_t)i * src_nch + c];
+			}
+		}
 	}
 
 	if (nch == 0 || acc[0].empty()) {

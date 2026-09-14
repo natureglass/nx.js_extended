@@ -29,16 +29,33 @@ typedef struct nx_media nx_media_t;
 #define NX_MEDIA_MAX_CHANNELS 32
 
 // Decode an entire audio resource (any ffmpeg-supported container/codec)
-// from memory into planar f32 channel buffers at the file's native sample
-// rate. Backs `decodeAudioData()` and the `Audio` element. On success fills
-// `channels[0..num_channels)` with malloc'd buffers (caller frees), `length`
-// (frames) and `sample_rate`, and returns true. Blocking — call on a worker
-// thread. On failure fills `errbuf` and returns false.
+// from memory into planar f32 channel buffers. Backs `decodeAudioData()` and
+// the `Audio` element.
+//
+// `target_rate` is the sample rate the decoded buffer should come back at —
+// pass the destination AudioContext's rate so the conversion happens ONCE
+// here, through libswresample's polyphase filter, instead of every frame in
+// the render loop's linear interpolator. 0 keeps the file's native rate.
+//
+// This matters more than it looks. The Switch's audio graph runs at 48 kHz
+// and most game assets ship at 44.1 kHz, so without this the buffer-source
+// node reads the buffer at r = 0.91875 with linear interpolation between
+// neighbouring samples — which is fine down low but costs -1.5 dB at 10 kHz,
+// -3.4 dB at 15 kHz, and folds back roughly -25 dB of imaging junk at 10 kHz
+// rising to -15 dB at 15 kHz. Smooth low-passed material (a music bed) hides
+// it; short bright percussive one-shots (coin blips, explosions, UI clicks)
+// audibly grit and dull. Browsers resample in decodeAudioData for exactly
+// this reason, and `r` then lands on 1.0 so the interpolator never engages.
+//
+// On success fills `channels[0..num_channels)` with malloc'd buffers (caller
+// frees), `length` (frames) and `sample_rate` (the rate actually produced),
+// and returns true. Blocking — call on a worker thread. On failure fills
+// `errbuf` and returns false.
 bool nx_media_decode_audio(const uint8_t *data, size_t size,
                            float *channels[NX_MEDIA_MAX_CHANNELS],
                            int *num_channels, uint32_t *length,
-                           uint32_t *sample_rate, char *errbuf,
-                           size_t errbuf_size);
+                           uint32_t *sample_rate, uint32_t target_rate,
+                           char *errbuf, size_t errbuf_size);
 
 // Open a media resource and probe its streams. Exactly one of `path` or
 // `mem` must be provided; for `mem`, `keepalive` must own the buffer (e.g. a

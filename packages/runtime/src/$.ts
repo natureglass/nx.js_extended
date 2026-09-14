@@ -516,6 +516,12 @@ export interface Init {
 	imageNew(width?: number, height?: number): Image | ImageBitmap;
 	imageDecode(img: Image | ImageBitmap, data: ArrayBuffer): Promise<void>;
 	imageClose(img: ImageBitmap): void;
+	/** Give an existing Image a fresh w*h BGRA backing buffer. */
+	/** Brotli-decompress (vendored google/brotli decoder). The primitive
+	 * WOFF2 decoding is built on; also what a `Content-Encoding: br` or
+	 * `DecompressionStream('br')` path would use. */
+	brotliDecompress(data: ArrayBuffer | ArrayBufferView): ArrayBuffer;
+	imageAlloc(image: Image, width: number, height: number): void;
 	imageWriteRGBA(
 		img: Image | ImageBitmap,
 		bytes: ArrayBuffer | Uint8Array | Uint8ClampedArray,
@@ -804,12 +810,41 @@ export interface Init {
 	): void;
 	audioSourceState(node: AudioNodeHandle): number;
 	audioOscillatorSetType(node: AudioNodeHandle, type: number): void;
+	/** Select the filter shape (an `nx_audio_biquad_type`). Resets the
+	 * filter state so a live switch does not ring. */
+	audioBiquadSetType(node: AudioNodeHandle, type: number): void;
+	/** Fill `mag` and `phase` with the filter response at each frequency in
+	 * `freqHz`. All three arrays must be the same length. */
+	audioBiquadFrequencyResponse(
+		node: AudioNodeHandle,
+		freqHz: Float32Array,
+		mag: Float32Array,
+		phase: Float32Array,
+	): void;
+	/** Install a ConvolverNode impulse response. The samples ARE copied (they
+	 * are transformed into partitioned spectra), unlike `audioSourceSetBuffer`.
+	 * `channels: null` clears the response, after which the node is silent. */
+	audioConvolverSetBuffer(
+		node: AudioNodeHandle,
+		channels: Float32Array[] | null,
+		length: number,
+		sampleRate: number,
+		normalize: boolean,
+	): void;
 	/** Current gain reduction in dB (<= 0) for DynamicsCompressorNode.reduction. */
 	audioCompressorReduction(node: AudioNodeHandle): number;
 	/** Fill `out` with the analyser's most-recent time-domain samples
 	 * (newest last, each in [-1, 1]). `out.length` samples are returned. */
 	audioAnalyserFloatTimeData(node: AudioNodeHandle, out: Float32Array): void;
-	audioDecode(buffer: ArrayBuffer): Promise<{
+	/** Decode a whole audio file to planar f32. `targetSampleRate` (the
+	 * destination context's rate) makes swresample do the rate conversion
+	 * once, here, rather than leaving it to the buffer-source node's
+	 * per-sample linear interpolation; omit or pass 0 to keep the file's
+	 * native rate. The resolved `sampleRate` is what was actually produced. */
+	audioDecode(
+		buffer: ArrayBuffer,
+		targetSampleRate?: number,
+	): Promise<{
 		channelData: ArrayBuffer[];
 		length: number;
 		sampleRate: number;

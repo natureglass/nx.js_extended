@@ -68,6 +68,21 @@ export const NODE_TYPE_OSCILLATOR = 5;
 export const NODE_TYPE_ANALYSER = 6;
 export const NODE_TYPE_DELAY = 7;
 export const NODE_TYPE_DYNAMICS_COMPRESSOR = 8;
+export const NODE_TYPE_BIQUAD_FILTER = 9;
+export const NODE_TYPE_CONVOLVER = 10;
+
+// BiquadFilterType values, indexed to match `nx_audio_biquad_type` in
+// `source/audio-graph.h` — the array position IS the wire value.
+export const BIQUAD_TYPES: BiquadFilterType[] = [
+	"lowpass",
+	"highpass",
+	"bandpass",
+	"lowshelf",
+	"highshelf",
+	"peaking",
+	"notch",
+	"allpass",
+];
 
 // OscillatorNode wave types — must match `nx_audio_oscillator_type` in
 // `source/audio-graph.h`. `'custom'` (PeriodicWave) is not yet supported.

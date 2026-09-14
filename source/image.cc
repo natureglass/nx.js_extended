@@ -482,6 +482,47 @@ void nx_image_new(const FunctionCallbackInfo<Value> &info) {
 	info.GetReturnValue().Set(img);
 }
 
+// Give an EXISTING Image a fresh `width`x`height` BGRA backing buffer,
+// discarding whatever it held. `imageNew(w, h)` can only do this at
+// construction, but an embedder that produces pixels for an image the PAGE
+// created (brewser rasterising `<svg><foreignObject>` HTML through its own
+// layout + painter, for `image.src = 'data:image/svg+xml,…'`) has no say in
+// how that Image was constructed. Pair with `imageWriteRGBA` to fill it.
+void nx_image_alloc(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	Local<Context> context = iso->GetCurrentContext();
+	nx_image_t *image = nx_get_image(iso, info[0]);
+	if (!image) {
+		nx_throw(iso, "imageAlloc: first arg must be an Image");
+		return;
+	}
+	uint32_t w = 0, h = 0;
+	if (!info[1]->Uint32Value(context).To(&w) ||
+	    !info[2]->Uint32Value(context).To(&h))
+		return;
+	if (w == 0 || h == 0 || w > 16384 || h > 16384 ||
+	    (size_t)h > SIZE_MAX / ((size_t)w * 4)) {
+		iso->ThrowException(
+		    Exception::RangeError(nx_str(iso, "imageAlloc: bad dimensions")));
+		return;
+	}
+	// Frees `data`, releases the memoized SkImage and zeroes width/height —
+	// skipping the cache release would leave the next drawImage painting the
+	// PREVIOUS contents, since canvas.cc keys its GPU upload on that pointer.
+	close_image(image);
+	uint8_t *buf = (uint8_t *)calloc(1, (size_t)w * h * 4);
+	if (!buf) {
+		nx_throw_oom(iso, (size_t)w * h * 4);
+		return;
+	}
+	image->data = buf;
+	image->width = w;
+	image->height = h;
+	image->format = FORMAT_PNG; // free(), not tjFree(), on teardown
+	image->unpremultiplied = false;
+	image->is_yuv = false;
+}
+
 void nx_image_close(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	nx_image_t *image = nx_get_image(iso, info[0]);
@@ -829,6 +870,7 @@ void nx_init_image(Isolate *iso, Local<Object> init_obj) {
 	NX_SET_FUNC(init_obj, "imageNew", nx_image_new);
 	NX_SET_FUNC(init_obj, "imageDecode", nx_image_decode);
 	NX_SET_FUNC(init_obj, "imageClose", nx_image_close);
+	NX_SET_FUNC(init_obj, "imageAlloc", nx_image_alloc);
 	NX_SET_FUNC(init_obj, "imageWriteRGBA", nx_image_write_rgba);
 	NX_SET_FUNC(init_obj, "imageWriteBGRA", nx_image_write_bgra);
 	NX_SET_FUNC(init_obj, "imageWriteYUV", nx_image_write_yuv);

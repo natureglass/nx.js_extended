@@ -53,6 +53,17 @@ enum nx_audio_node_type {
 	// ever attenuated), so it is safe to drop into a master bus without a
 	// surprise loudness jump. `reduction` (read-only, dB, <= 0) is polled by JS.
 	NX_AUDIO_NODE_DYNAMICS_COMPRESSOR = 8,
+	// BiquadFilterNode — a second-order IIR filter (the Audio EQ Cookbook
+	// shapes the Web Audio spec prescribes). Coefficients are recomputed once
+	// per render quantum (k-rate) from frequency / detune / Q / gain; the two
+	// channels carry independent direct-form-I state across quanta.
+	NX_AUDIO_NODE_BIQUAD_FILTER = 9,
+	// ConvolverNode — FFT convolution with an impulse response, used for
+	// reverb and cabinet/speaker simulation. Uniformly-partitioned overlap-save
+	// with a frequency-delay line, so cost is O(K) spectral multiply-accumulates
+	// per block rather than O(N^2) time-domain taps. The partition size is the
+	// node's latency (see NX_AUDIO_CONVOLVER_BLOCK).
+	NX_AUDIO_NODE_CONVOLVER = 10,
 };
 
 // OscillatorNode wave types (matches OscillatorType wire values in JS).
@@ -62,6 +73,31 @@ enum nx_audio_oscillator_type {
 	NX_AUDIO_OSCILLATOR_SAWTOOTH = 2,
 	NX_AUDIO_OSCILLATOR_TRIANGLE = 3,
 };
+
+// BiquadFilterNode shapes (matches BiquadFilterType wire values in JS).
+enum nx_audio_biquad_type {
+	NX_AUDIO_BIQUAD_LOWPASS = 0,
+	NX_AUDIO_BIQUAD_HIGHPASS = 1,
+	NX_AUDIO_BIQUAD_BANDPASS = 2,
+	NX_AUDIO_BIQUAD_LOWSHELF = 3,
+	NX_AUDIO_BIQUAD_HIGHSHELF = 4,
+	NX_AUDIO_BIQUAD_PEAKING = 5,
+	NX_AUDIO_BIQUAD_NOTCH = 6,
+	NX_AUDIO_BIQUAD_ALLPASS = 7,
+};
+
+// ConvolverNode partition size, in frames. The impulse response is chopped
+// into blocks of this length, each transformed once at assignment time; the
+// input is convolved a block at a time by overlap-save. It is the node's
+// input-to-output latency (1024 frames ~= 21 ms at 48 kHz), and it trades
+// against CPU: halving it doubles the number of spectral multiply-accumulates
+// per sample. Must be a multiple of the render quantum.
+#define NX_AUDIO_CONVOLVER_BLOCK 1024
+// Longest impulse response kept, in seconds. The partitioned spectra plus the
+// frequency-delay line cost ~16 bytes per impulse frame per channel, so an
+// unbounded cap would let a page (pixi-sound's ReverbFilter accepts up to 50 s)
+// allocate hundreds of megabytes. Longer responses are truncated.
+#define NX_AUDIO_CONVOLVER_MAX_SECONDS 5.0
 
 // AudioParam automation event types (matches the JS side's wire protocol).
 enum nx_audio_param_event_type {
@@ -95,6 +131,37 @@ struct nx_audio_param {
 	std::vector<nx_audio_param_event> events; // sorted by time
 };
 
+// In-place iterative radix-2 complex FFT with precomputed twiddles and
+// bit-reversal permutation. Shared by every ConvolverNode using the same
+// transform size (it lives on the impulse response, which nodes share).
+struct nx_audio_fft {
+	uint32_t size = 0;
+	std::vector<uint32_t> rev;   // bit-reversal permutation
+	std::vector<float> tw_cos;   // size/2 twiddles
+	std::vector<float> tw_sin;
+	void init(uint32_t n);
+	// Decimation-in-time forward transform (unscaled).
+	void forward(float *re, float *im) const;
+	// Inverse via the conjugate trick, scaled by 1/size.
+	void inverse(float *re, float *im) const;
+};
+
+// A ConvolverNode impulse response, pre-transformed into per-partition
+// spectra. Immutable once built, and held by shared_ptr so the control thread
+// can do the (expensive) transform work outside the graph mutex and then swap
+// the finished object in under it, without ever tearing a response the render
+// thread is mid-way through reading.
+struct nx_audio_convolver_ir {
+	uint32_t block = 0;      // partition size, frames
+	uint32_t fft_size = 0;   // 2 * block
+	uint32_t bins = 0;       // fft_size / 2 + 1 (the non-redundant half)
+	uint32_t partitions = 0; // ceil(impulse frames / block)
+	int channels = 1;        // 1 = the same response on both channels
+	nx_audio_fft fft;
+	// Per channel, `partitions * bins` complex bins as (re, im) pairs.
+	std::vector<float> spectra[NX_AUDIO_CHANNELS];
+};
+
 struct nx_audio_graph;
 
 struct nx_audio_node {
@@ -111,6 +178,11 @@ struct nx_audio_node {
 	// Per-quantum processing state.
 	uint64_t processed_quantum = 0;
 	bool processing = false; // cycle guard
+	// Permanently silent: a finished source, or a pure gain/panner all of whose
+	// inputs are permanently silent. Such a node can never produce signal again,
+	// so the render walk skips it entirely. Cleared when an input is connected.
+	bool silent = false;
+	bool silent_checking = false; // cycle guard for the silence propagation
 	float bus[NX_AUDIO_CHANNELS][NX_AUDIO_RENDER_QUANTUM];
 	// Channel count of the bus content: 1 = mono (L==R), 2 = true stereo.
 	// Drives spec-correct mono vs stereo panning behavior.
@@ -121,6 +193,7 @@ struct nx_audio_node {
 	//   STEREO_PANNER: 0 = pan
 	//   BUFFER_SOURCE: 0 = playbackRate, 1 = detune
 	//   OSCILLATOR:    0 = frequency, 1 = detune
+	//   BIQUAD_FILTER: 0 = frequency, 1 = detune, 2 = Q, 3 = gain
 	//   DELAY:         0 = delayTime
 	//   DYNAMICS_COMPRESSOR: 0 = threshold, 1 = knee, 2 = ratio,
 	//                        3 = attack, 4 = release
@@ -191,6 +264,46 @@ struct nx_audio_node {
 	// back through the read-only `.reduction` property.
 	double comp_env_db = 0.0;
 	float comp_reduction = 0.f;
+
+	// ---- biquad filter state (NX_AUDIO_NODE_BIQUAD_FILTER) ----
+	// Direct-form-I history, per channel: x[n-1], x[n-2], y[n-1], y[n-2].
+	// Kept in double so a high-Q filter's state doesn't drift on float32.
+	int biquad_type = NX_AUDIO_BIQUAD_LOWPASS;
+	double biquad_x1[NX_AUDIO_CHANNELS] = {0, 0};
+	double biquad_x2[NX_AUDIO_CHANNELS] = {0, 0};
+	double biquad_y1[NX_AUDIO_CHANNELS] = {0, 0};
+	double biquad_y2[NX_AUDIO_CHANNELS] = {0, 0};
+
+	// ---- convolver state (NX_AUDIO_NODE_CONVOLVER) ----
+	// `conv_ir` is swapped wholesale when the page assigns `.buffer`; the
+	// render thread copies the shared_ptr so a swap mid-quantum is safe.
+	// `conv_in` holds 2 * block frames per channel — the previous block
+	// followed by the one being filled — which is the overlap-save window.
+	// `conv_fdl` is the frequency-delay line: the spectra of the last
+	// `partitions` windows, newest at `conv_fdl_slot`.
+	std::shared_ptr<nx_audio_convolver_ir> conv_ir;
+	std::vector<float> conv_in[NX_AUDIO_CHANNELS];
+	std::vector<float> conv_out[NX_AUDIO_CHANNELS];
+	std::vector<float> conv_fdl[NX_AUDIO_CHANNELS];
+	// Per delay-line slot: is that stored spectrum known to be all zeros? A
+	// zero spectrum contributes nothing, so those partitions are skipped. That
+	// is the difference between a convolver costing its full price whenever a
+	// reverb tail is ringing out and costing it only while signal is arriving
+	// — which for one-shot sound effects is the overwhelming majority case.
+	std::vector<uint8_t> conv_fdl_zero;
+	std::vector<float> conv_scratch_re; // fft_size
+	std::vector<float> conv_scratch_im;
+	std::vector<float> conv_acc_re; // bins
+	std::vector<float> conv_acc_im;
+	uint32_t conv_fdl_slot = 0;
+	uint32_t conv_fill = 0;    // frames accumulated into the current block
+	uint32_t conv_out_pos = 0; // read cursor into conv_out
+	// Consecutive all-zero input blocks. Once it exceeds `partitions` the
+	// whole delay line is known to be zero, so the tail has fully decayed and
+	// the (expensive) transform work is skipped until signal returns.
+	uint32_t conv_zero_blocks = 0;
+	bool conv_prev_zero = true; // was the previous input block all zeros?
+	int conv_out_ch = 1;
 };
 
 struct nx_audio_graph {
@@ -253,6 +366,29 @@ int nx_audio_source_playback_state(nx_audio_node *n);
 
 // ---- oscillator ----
 void nx_audio_oscillator_set_type(nx_audio_node *n, int type);
+
+// ---- biquad filter ----
+void nx_audio_biquad_set_type(nx_audio_node *n, int type);
+// Evaluates |H(e^jw)| and arg H(e^jw) at each of `count` frequencies (Hz),
+// using the coefficients for the parameter values at the current time.
+// Frequencies outside [0, Nyquist] yield NaN, per spec.
+void nx_audio_biquad_frequency_response(nx_audio_node *n,
+                                        const float *frequency_hz,
+                                        float *mag_response,
+                                        float *phase_response, uint32_t count);
+
+// ---- convolver ----
+// Installs an impulse response (the samples ARE copied — they are transformed,
+// not read live). `channels` may be 1 (same response both sides) or 2. Passing
+// num_channels <= 0 clears the response, after which the node outputs silence,
+// per spec. Resamples to the graph rate if needed, truncates beyond
+// NX_AUDIO_CONVOLVER_MAX_SECONDS, and applies the spec's RMS normalisation
+// when `normalize` is set. The transform work happens BEFORE the graph mutex
+// is taken, so a multi-second response doesn't stall the render thread.
+void nx_audio_convolver_set_buffer(nx_audio_node *n,
+                                   const float *const *channels,
+                                   int num_channels, uint32_t length,
+                                   double sample_rate, bool normalize);
 
 // ---- dynamics compressor ----
 // Current gain reduction in dB (<= 0), for the read-only `.reduction` property.

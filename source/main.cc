@@ -23,6 +23,7 @@
 #include FT_FREETYPE_H
 
 #include "detect.h"
+#include "brotli_bind.h"
 #include "error.h"
 #include "hidsys.h"
 #include "module.h"
@@ -1209,6 +1210,7 @@ static void build_init_object(Isolate *iso, Local<Context> context,
 	nx_init_gamepad(iso, init_obj);
 	nx_init_hidsys(iso, init_obj);
 	nx_init_image(iso, init_obj);
+	nx_init_brotli(iso, init_obj);
 	nx_init_irs(iso, init_obj);
 	nx_init_memory(iso, init_obj);
 	nx_init_nfc(iso, init_obj);

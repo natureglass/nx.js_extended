@@ -7,6 +7,8 @@ import { AudioBuffer, createAudioBuffer } from './audio-buffer';
 import { AudioBufferSourceNode } from './audio-buffer-source-node';
 import { AudioDestinationNode } from './audio-destination-node';
 import { AnalyserNode } from './analyser-node';
+import { BiquadFilterNode } from './biquad-filter-node';
+import { ConvolverNode } from './convolver-node';
 import { DelayNode } from './delay-node';
 import { DynamicsCompressorNode } from './dynamics-compressor-node';
 import { GainNode } from './gain-node';
@@ -167,10 +169,12 @@ export class BaseAudioContext
 	 * Any audio container/codec supported by [FFmpeg](https://ffmpeg.org),
 	 * including MP3, WAV, OGG Vorbis, Opus, FLAC and AAC/M4A.
 	 *
-	 * > [!NOTE]
-	 * > Unlike browsers, nx.js does NOT resample the decoded data to the
-	 * > context's sample rate — the returned buffer keeps the file's native
-	 * > rate (resampling happens at playback time).
+	 * Per spec the decoded data is resampled to this context's sample rate,
+	 * so the returned buffer's `sampleRate` is always `this.sampleRate`.
+	 * The conversion runs once here, through swresample's polyphase filter.
+	 * That matters on Switch: the graph is 48 kHz and most game assets are
+	 * 44.1 kHz, and the buffer-source node's fallback is per-sample linear
+	 * interpolation, which is audibly gritty on short bright one-shots.
 	 *
 	 * @see https://developer.mozilla.org/docs/Web/API/BaseAudioContext/decodeAudioData
 	 */
@@ -188,7 +192,7 @@ export class BaseAudioContext
 		const transfer = (audioData as any).transfer;
 		const data: ArrayBuffer =
 			typeof transfer === 'function' ? transfer.call(audioData) : audioData;
-		const promise = $.audioDecode(data).then(
+		const promise = $.audioDecode(data, this.sampleRate).then(
 			({ channelData, sampleRate }) => {
 				const buffer = createAudioBuffer(
 					channelData.map((ab) => new Float32Array(ab)),
@@ -214,8 +218,14 @@ export class BaseAudioContext
 	createAnalyser(): AnalyserNode {
 		return new AnalyserNode(this);
 	}
+	/**
+	 * Creates a {@link BiquadFilterNode} — a second-order filter section
+	 * (lowpass, highpass, shelving, peaking, ...).
+	 *
+	 * @see https://developer.mozilla.org/docs/Web/API/BaseAudioContext/createBiquadFilter
+	 */
 	createBiquadFilter(): BiquadFilterNode {
-		throw new Error('Method not implemented.');
+		return new BiquadFilterNode(this);
 	}
 	createChannelMerger(numberOfInputs?: number): ChannelMergerNode {
 		throw new Error('Method not implemented.');
@@ -226,8 +236,14 @@ export class BaseAudioContext
 	createConstantSource(): ConstantSourceNode {
 		throw new Error('Method not implemented.');
 	}
+	/**
+	 * Creates a {@link ConvolverNode} for convolution reverb. It renders
+	 * silence until an impulse response is assigned to its `buffer`.
+	 *
+	 * @see https://developer.mozilla.org/docs/Web/API/BaseAudioContext/createConvolver
+	 */
 	createConvolver(): ConvolverNode {
-		throw new Error('Method not implemented.');
+		return new ConvolverNode(this);
 	}
 	/**
 	 * Creates a {@link DelayNode} for delaying its input, up to `maxDelayTime`

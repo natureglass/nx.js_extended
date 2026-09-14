@@ -1,11 +1,11 @@
-import type { IFont } from 'parse-css-font';
+import parseCssFont, { type IFont } from 'parse-css-font';
 import { $ } from '../$';
 import { INTERNAL_SYMBOL } from '../internal';
 import { EventTarget } from '../polyfills/event-target';
 import type { screen } from '../screen';
 import type { FontFaceSetLoadStatus } from '../types';
 import { assertInternalConstructor, def } from '../utils';
-import { FontFace } from './font-face';
+import { FontFace, isFontFaceUsable, nativeFontFace } from './font-face';
 
 /**
  * Manages the loading of font-faces and querying of their download status.
@@ -30,11 +30,58 @@ export class FontFaceSet extends EventTarget {
 	onloadingerror: ((this: FontFaceSet, ev: Event) => any) | null = null;
 	ready: Promise<this>;
 	status: FontFaceSetLoadStatus;
-	check(font: string, text?: string | undefined): boolean {
-		throw new Error('Method not implemented.');
+	/**
+	 * Whether every font needed to render `text` in `font` is available.
+	 *
+	 * Every face in this set is fully decoded at `add()` time (there is no
+	 * pending/loading state on this platform), so "available" reduces to
+	 * "a face with a matching family is registered" — plus `system-ui` /
+	 * `sans-serif`, which `addSystemFont()` materialises from the Switch's
+	 * shared font on demand and therefore always resolve.
+	 *
+	 * Matching is by family name only, case-insensitively. `findFont()`
+	 * additionally requires an exact weight/style/stretch match because it
+	 * has to pick ONE face to rasterise with; `check()` is asking a broader
+	 * question ("would text in this family render?"), and browsers answer
+	 * yes there by synthesising the missing variant.
+	 *
+	 * Deviation from spec: an unparseable `font` shorthand returns false
+	 * rather than throwing a SyntaxError. Callers reach `check()` through
+	 * feature-detection paths where a throw is far more damaging than a
+	 * conservative false.
+	 */
+	check(font: string, _text?: string | undefined): boolean {
+		const families = familiesOf(font);
+		if (families.length === 0) return false;
+		for (const family of families) {
+			if (isFamilyAvailable(this, family)) return true;
+		}
+		return false;
 	}
-	load(font: string, text?: string | undefined): Promise<FontFace[]> {
-		throw new Error('Method not implemented.');
+
+	/**
+	 * Resolve the faces matching `font`. Nothing is fetched here: a
+	 * {@link FontFace} owns decoded bytes from the moment it is constructed,
+	 * so by the time a face is in this set it is loaded. Resolves with the
+	 * matching faces (empty when none match) and never rejects — same
+	 * reasoning as `check()` above.
+	 */
+	load(font: string, _text?: string | undefined): Promise<FontFace[]> {
+		const families = familiesOf(font);
+		const out: FontFace[] = [];
+		for (const family of families) {
+			const lower = family.toLowerCase();
+			for (const face of this.#set) {
+				if (
+					face.family.toLowerCase() === lower &&
+					isFontFaceUsable(face) &&
+					!out.includes(face)
+				) {
+					out.push(face);
+				}
+			}
+		}
+		return Promise.resolve(out);
 	}
 
 	// Set interface
@@ -75,6 +122,45 @@ export class FontFaceSet extends EventTarget {
 		return this.#set[Symbol.iterator]();
 	}
 }
+/** Families the runtime can always produce, whether or not a face for them
+ * is in the set yet — `addSystemFont()` registers both from the Switch's
+ * shared font the first time an unmatched family is requested. */
+const ALWAYS_AVAILABLE_FAMILIES = new Set(['system-ui', 'sans-serif']);
+
+/** Family list from a CSS `font` shorthand, or from a bare family name.
+ * Returns [] when the input can't be understood. */
+function familiesOf(font: string): string[] {
+	if (typeof font !== 'string' || font.trim() === '') return [];
+	try {
+		const parsed = parseCssFont(font);
+		const family = (parsed as IFont).family;
+		if (family && family.length > 0) return family;
+	} catch {
+		// Not a full shorthand. Callers (Cocos's loader, for one) pass a bare
+		// family name to load()/check(), which parse-css-font rejects since
+		// the shorthand requires a size. Fall through and treat the input as
+		// a comma-separated family list.
+	}
+	return font
+		.split(',')
+		.map((f) => f.trim().replace(/^['"]|['"]$/g, ''))
+		.filter((f) => f.length > 0);
+}
+
+function isFamilyAvailable(set: FontFaceSet, family: string): boolean {
+	const lower = family.toLowerCase();
+	if (ALWAYS_AVAILABLE_FAMILIES.has(lower)) return true;
+	for (const face of set) {
+		// A url()-sourced face that has not finished `load()` yet has no
+		// glyphs, so reporting it as available would make a page skip its
+		// own wait and render in the fallback.
+		if (face.family.toLowerCase() === lower && isFontFaceUsable(face)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 def(FontFaceSet);
 
 /**
@@ -108,7 +194,11 @@ export function findFont(
 				desired.style === fontFace.style &&
 				desired.weight === fontFace.weight
 			) {
-				return fontFace;
+				// url()-sourced faces are a JS shell around a buffer-backed
+				// FontFace; native code can only unwrap the latter. `null`
+				// means "still loading" — keep looking.
+				const native = nativeFontFace(fontFace);
+				if (native) return native;
 			}
 		}
 	}

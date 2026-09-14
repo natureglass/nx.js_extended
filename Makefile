@@ -51,9 +51,15 @@ LIBTURBOJPEG_VERSION := $(shell $(DEVKITPRO)/pacman/bin/pacman -Q switch-libjpeg
 
 TARGET		:=	nxjs
 BUILD		:=	build
-SOURCES		:=	source
+# `source/brotli` is a vendored copy of google/brotli 1.2.0's DECODER
+# (c/common + c/dec + c/include, MIT — see source/brotli/LICENSE). devkitPro
+# ships no brotli portlib and FreeType here is built without
+# FT_CONFIG_OPTION_USE_BROTLI, so WOFF2 — which every modern web font ships as
+# — could not be decoded at all. Vendored rather than packaged so the repo
+# stays self-contained and no extra pacman package is needed to build it.
+SOURCES		:=	source source/brotli/common source/brotli/dec
 DATA		:=	data
-INCLUDES	:=	include
+INCLUDES	:=	include source/brotli/include
 EXEFS_SRC	:=	exefs_src
 ROMFS		:=	romfs
 CONFIG_JSON	:=	npdm.json
@@ -230,9 +236,16 @@ all: $(BUILD)
 
 # Embed runtime.js as a C byte array (replaces the old qjsc bytecode step).
 # V8 evaluates the runtime from source at boot.
-$(SOURCES)/runtime_js.c: packages/runtime/runtime.js tools/embed-runtime.mjs
-	@node tools/embed-runtime.mjs packages/runtime/runtime.js $(SOURCES)/runtime_js.c
-	@echo "embedded 'packages/runtime/runtime.js' -> '$(SOURCES)/runtime_js.c'"
+# NB: use the literal path, NOT $(SOURCES) — that is a LIST of source dirs
+# (source, source/brotli/common, source/brotli/dec), so `$(SOURCES)/runtime_js.c`
+# expanded to three bogus targets and none of them was `source/runtime_js.c`.
+# The stale file on disk then had no rule, make called it up to date, and every
+# NRO silently shipped whatever runtime.js had been embedded last — C++ changes
+# landed while the TypeScript half did not. Cost a full debug cycle 2026-09-14.
+RUNTIME_JS_C := source/runtime_js.c
+$(RUNTIME_JS_C): packages/runtime/runtime.js tools/embed-runtime.mjs
+	@node tools/embed-runtime.mjs packages/runtime/runtime.js $@
+	@echo "embedded 'packages/runtime/runtime.js' -> '$@'"
 
 $(ROMFS)/runtime.js.map: packages/runtime/runtime.js.map
 	@mkdir -p $(ROMFS)
@@ -248,7 +261,7 @@ $(ROMFS)/GeistMono.ttf: $(GEIST_MONO_TTF)
 	@mkdir -p $(ROMFS)
 	@cp -v $(GEIST_MONO_TTF) $(ROMFS)/GeistMono.ttf
 
-$(BUILD): source/runtime_js.c romfs/runtime.js.map romfs/GeistMono.ttf
+$(BUILD): $(RUNTIME_JS_C) romfs/runtime.js.map romfs/GeistMono.ttf
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 

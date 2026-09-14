@@ -118,9 +118,24 @@
 // If 2.C/2.D surfaces "Skia renders garbage after WebGL draws" symptoms on
 // hardware, the FIRST place to look is this list — a missing entry under a
 // new code path is the most likely cause.
-// Upper bound on texture units the snapshot will save/restore. WebGL 2
-// guarantees at least 16 combined; PIXI caps its batch at 16.
-#define NX_GL_MAX_TRACKED_TEX_UNITS 16
+// Upper bound on texture units the snapshot will save/restore.
+//
+// Was 16, chosen because WebGL 2 guarantees at least 16 combined units and
+// PIXI caps its batch at 16. That is a floor, not the number this GPU has:
+// Mesa-Nouveau on Tegra reports 32 fragment units, and Phaser sizes its
+// multi-texture batch from `MAX_TEXTURE_IMAGE_UNITS` and binds a texture to
+// EVERY unit at boot. Anything landing on unit 16..31 was silently dropped by
+// `nx_gl_note_tex_unit`, so it was neither saved nor restored across the Skia
+// bracket — and a batch that caches its unit assignment (Phaser does; it only
+// rebinds when `glIndex` goes stale) then sampled whatever Ganesh left there.
+// See the `tex2d_units` comment below for the signature: a vertically flipped
+// squashed copy of the scene, i.e. the tenant FBO's own colour attachment.
+//
+// Cost is proportional to units the page ACTUALLY touches
+// (`nx_gl_tracked_tex_units` only grows), so a 2-unit page is unaffected; a
+// page that binds all 32 pays 32 client-side queries per bracket, which is
+// what correctness requires.
+#define NX_GL_MAX_TRACKED_TEX_UNITS 32
 
 struct nx_gl_state_snap_t {
 	GLint fbo;
