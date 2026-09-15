@@ -1079,6 +1079,8 @@ void process_node(nx_audio_graph *g, nx_audio_node *n, double t0) {
 	n->processed_quantum = g->quantum_id;
 }
 
+bool mark_silent(nx_audio_node *n);
+
 // Marks nodes that can never produce signal again. A source that has finished
 // playing is silent forever (Web Audio lets the implementation drop it from the
 // rendering graph at that point — Chrome disconnects it immediately rather than
@@ -1089,37 +1091,92 @@ void process_node(nx_audio_graph *g, nx_audio_node *n, double t0) {
 // Without this, a fire-and-forget app (one oscillator+gain per tracker row, the
 // standard Web Audio idiom) keeps every note it has ever played in the render
 // walk, so per-quantum cost grows without bound.
+// True when `n` has inputs and every one of them is permanently silent, so this
+// node will never be fed signal again. An input-less node returns false: nothing
+// stops the page connecting a source into it later.
+bool inputs_all_silent(nx_audio_node *n) {
+	if (n->inputs.empty())
+		return false;
+	n->silent_checking = true;
+	bool all = true;
+	for (nx_audio_node *src : n->inputs) {
+		if (!mark_silent(src)) {
+			all = false;
+			break;
+		}
+	}
+	n->silent_checking = false;
+	return all;
+}
+
+// A filter still rings after its input dies, so it may only be declared silent
+// once its own state has decayed. 1e-9 is ~180 dB below full scale — far below
+// one LSB of the s16 output — and stops a denormal trickle from keeping a node
+// alive forever.
+bool biquad_state_decayed(const nx_audio_node *n) {
+	constexpr double EPS = 1e-9;
+	for (int c = 0; c < NX_AUDIO_CHANNELS; c++) {
+		if (fabs(n->biquad_x1[c]) > EPS || fabs(n->biquad_x2[c]) > EPS ||
+		    fabs(n->biquad_y1[c]) > EPS || fabs(n->biquad_y2[c]) > EPS)
+			return false;
+	}
+	return true;
+}
+
 bool mark_silent(nx_audio_node *n) {
 	if (n->silent)
 		return true;
 	if (n->silent_checking)
 		return false; // in a cycle — assume live
+	// Every node type is listed: a new one must make an explicit choice here
+	// rather than silently defaulting to "never silent", which is how adding
+	// BiquadFilterNode re-opened the unbounded-render-cost bug this guards
+	// against. Do NOT reintroduce a `default:` label.
 	switch (n->type) {
 	case NX_AUDIO_NODE_OSCILLATOR:
 	case NX_AUDIO_NODE_BUFFER_SOURCE:
+		// A source that has finished playing can never produce signal again.
 		if (!n->started || n->playback_state != NX_AUDIO_SOURCE_FINISHED)
 			return false;
 		break;
 	case NX_AUDIO_NODE_GAIN:
-	case NX_AUDIO_NODE_STEREO_PANNER: {
-		if (n->inputs.empty())
-			return false; // may still be connected to later
-		n->silent_checking = true;
-		bool all = true;
-		for (nx_audio_node *src : n->inputs) {
-			if (!mark_silent(src)) {
-				all = false;
-				break;
-			}
-		}
-		n->silent_checking = false;
-		if (!all)
+	case NX_AUDIO_NODE_STEREO_PANNER:
+		// Purely multiplicative: silent in, exact zeros out, whatever the
+		// parameter value.
+		if (!inputs_all_silent(n))
+			return false;
+		break;
+	case NX_AUDIO_NODE_BIQUAD_FILTER:
+		// IIR: wait for the ringing to die before declaring it silent.
+		if (!inputs_all_silent(n) || !biquad_state_decayed(n))
+			return false;
+		break;
+	case NX_AUDIO_NODE_CONVOLVER: {
+		// Wait for the reverb tail. process_convolver already tracks a run of
+		// silent input blocks and, once it exceeds the frequency-delay line,
+		// zeroes its output — at that point every stored spectrum is zero and
+		// nothing is left to ring out.
+		std::shared_ptr<nx_audio_convolver_ir> ir = n->conv_ir;
+		if (!ir || ir->partitions == 0)
+			return false; // no impulse response yet; one may still be assigned
+		// `conv_zero_blocks` saturates at partitions + 1, and the block that
+		// pushes it past `partitions` is the one that zeroes conv_out — so
+		// "> partitions" is both the engine's own tail-decayed condition and
+		// the tightest test available here.
+		if (!inputs_all_silent(n) || n->conv_zero_blocks <= ir->partitions)
 			return false;
 		break;
 	}
-	default:
-		// Destination, analyser, delay (tail), compressor (envelope state) and
-		// the media stream source are never declared permanently silent.
+	case NX_AUDIO_NODE_DESTINATION:
+	case NX_AUDIO_NODE_STREAM_SOURCE:
+	case NX_AUDIO_NODE_ANALYSER:
+	case NX_AUDIO_NODE_DELAY:
+	case NX_AUDIO_NODE_DYNAMICS_COMPRESSOR:
+		// Never declared permanently silent: the destination and the media
+		// stream source are endpoints, an analyser must keep filling its ring
+		// for JS to read, and the delay (ring contents) and compressor
+		// (envelope) carry state that the cheap checks above cannot settle.
+		// These are all long-lived singletons, so they never accumulate.
 		return false;
 	}
 	n->silent = true;
