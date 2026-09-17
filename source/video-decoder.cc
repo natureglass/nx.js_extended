@@ -62,6 +62,12 @@ struct nx_video_decoder_t {
 	// and race-free exactly as the synchronous path was.
 	std::thread open_thread;
 	std::string open_url;
+	// Per-open HTTP request shaping (2026-09-17). Owned here (not borrowed
+	// from the V8 strings, which are gone by the time open_thread runs) and
+	// read only by that thread before it publishes `media`. Empty = use the
+	// engine default UA / send no Referer. See nx_media_net_t.
+	std::string open_user_agent;
+	std::string open_referer;
 	bool open_want_loop = false;
 	// When true the media ring is opened in planar I420 mode (see
 	// nx_media_open want_yuv): frame_buf holds 1.5 B/px, next_frame delivers
@@ -69,8 +75,19 @@ struct nx_video_decoder_t {
 	// image. Set at construction from the brewser <video> path.
 	bool want_yuv = false;
 	std::atomic<bool> open_done{false};
+	// Cancel latch handed to nx_media_open. Set before EVERY join of
+	// open_thread: the open can be parked in a blocking connect/read, and
+	// joining it without this stalls the V8 main thread for the whole
+	// rw_timeout (30s). That freeze is what made leaving a page mid-load,
+	// or switching channels while one was still connecting, lock the UI.
+	// Declared before `media` so it outlives it during destruction.
+	std::atomic<bool> open_abort{false};
 	nx_media_t *media = nullptr; // published by open_thread; read via ready_media()
 	char open_err[256] = {};
+	// Raw AVERROR behind `open_err`, published under the same open_done
+	// barrier. Exposed to JS as `errorKind` so a page can tell a permanent
+	// rejection from a transient one instead of parsing `error` text.
+	int open_av_err = 0;
 	// Controls issued while still pending are remembered and applied on the
 	// MAIN thread the first time next_frame() observes the media ready
 	// (nx_media clock fields are main-thread-only, so the open thread must
@@ -143,6 +160,9 @@ static void apply_pending_on_ready(nx_video_decoder_t *d, nx_media_t *m) {
 
 void free_video_decoder(nx_video_decoder_t *d) {
 	// Join the open thread FIRST so it can't publish/destroy media under us.
+	// Latch the abort before joining, or a still-connecting open blocks this
+	// thread until rw_timeout expires.
+	d->open_abort.store(true, std::memory_order_relaxed);
 	if (d->open_thread.joinable()) d->open_thread.join();
 	if (d->media) {
 		nx_media_destroy(d->media); // joins decode thread first
@@ -177,6 +197,8 @@ void nx_video_decoder_new(const FunctionCallbackInfo<Value> &info) {
 
 	bool want_loop = false;
 	bool want_yuv = false;
+	std::string opt_user_agent;
+	std::string opt_referer;
 	if (info.Length() >= 2 && info[1]->IsObject()) {
 		Local<Object> opts = info[1].As<Object>();
 		Local<Value> loop_val;
@@ -193,6 +215,24 @@ void nx_video_decoder_new(const FunctionCallbackInfo<Value> &info) {
 		    yuv_val->IsBoolean()) {
 			want_yuv = yuv_val->BooleanValue(iso);
 		}
+		// `userAgent` / `referer` (2026-09-17) — override the HTTP request
+		// shaping for http(s) sources. Ignored for local media. Both are
+		// sanitised of CR/LF down in nx_media_open, at the point of use,
+		// rather than here: that keeps the guarantee attached to the code
+		// that actually composes the request, so a future second caller of
+		// nx_media_open cannot bypass it.
+		Local<Value> ua_val;
+		if (opts->Get(ctx, nx_str(iso, "userAgent")).ToLocal(&ua_val) &&
+		    ua_val->IsString()) {
+			String::Utf8Value s(iso, ua_val);
+			if (*s) opt_user_agent = *s;
+		}
+		Local<Value> ref_val;
+		if (opts->Get(ctx, nx_str(iso, "referer")).ToLocal(&ref_val) &&
+		    ref_val->IsString()) {
+			String::Utf8Value s(iso, ref_val);
+			if (*s) opt_referer = *s;
+		}
 		// hwAccel, muted, noAudio: consumed silently. nx_media picks
 		// hw/sw internally; the audio graph is wired lazily by the JS
 		// wrapper once the (async) open reports a usable audio stream.
@@ -207,15 +247,26 @@ void nx_video_decoder_new(const FunctionCallbackInfo<Value> &info) {
 	d->open_url = url;
 	d->open_want_loop = want_loop;
 	d->want_yuv = want_yuv;
+	d->open_user_agent = std::move(opt_user_agent);
+	d->open_referer = std::move(opt_referer);
 	d->open_thread = std::thread([d]() {
 		char err[256] = {};
+		// Empty string -> NULL so nx_media_open applies its own default UA
+		// (and sends no Referer) rather than setting an empty header.
+		const nx_media_net_t net = {
+		    d->open_user_agent.empty() ? nullptr : d->open_user_agent.c_str(),
+		    d->open_referer.empty() ? nullptr : d->open_referer.c_str(),
+		};
+		int av_err = 0;
 		nx_media_t *m = nx_media_open(d->open_url.c_str(), nullptr, 0,
-		                              nullptr, err, sizeof(err), d->want_yuv);
+		                              nullptr, err, sizeof(err), d->want_yuv,
+		                              &net, &av_err, &d->open_abort);
 		if (m) {
 			if (d->open_want_loop) nx_media_set_loop(m, true);
 			d->media = m; // made visible by the open_done release store
 		} else {
 			snprintf(d->open_err, sizeof(d->open_err), "%s", err);
+			d->open_av_err = av_err;
 		}
 		d->open_done.store(true, std::memory_order_release);
 	});
@@ -274,9 +325,12 @@ void nx_video_decoder_close(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = get_decoder(iso, info[0]);
 	if (!d || d->closed) return;
 	d->closed = true;
-	// Join the open thread first (bounded by the network rw_timeout) so it
-	// can't publish media after we've torn it down — same ordering as the
-	// finalizer.
+	// Join the open thread first so it can't publish media after we've torn
+	// it down — same ordering as the finalizer. The abort latch is what
+	// keeps this from blocking: close() is called straight from JS (a page
+	// navigating away, a user cancelling a load), so it must return promptly
+	// even when the open is parked on an unreachable host.
+	d->open_abort.store(true, std::memory_order_relaxed);
 	if (d->open_thread.joinable()) d->open_thread.join();
 	if (d->media) {
 		nx_media_destroy(d->media); // joins decode thread first
@@ -612,6 +666,20 @@ void nx_vd_get_error(const FunctionCallbackInfo<Value> &info) {
 	}
 	info.GetReturnValue().SetNull();
 }
+// Short stable token for WHY the open failed ("forbidden", "not-found",
+// "timeout", "network", ...), or null while opening / once open succeeded.
+// Lets a catalogue page retire a 404 permanently but retry a timeout, rather
+// than blacklisting a working stream after one blip.
+void nx_vd_get_error_kind(const FunctionCallbackInfo<Value> &info) {
+	Isolate *iso = info.GetIsolate();
+	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
+	if (d && d->open_done.load(std::memory_order_acquire) && d->open_err[0]) {
+		info.GetReturnValue().Set(
+		    nx_str_lossy(iso, nx_media_fail_kind(d->open_av_err)));
+		return;
+	}
+	info.GetReturnValue().SetNull();
+}
 void nx_vd_get_ended(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
 	nx_media_t *m = ready_media(d);
@@ -691,6 +759,7 @@ void nx_video_decoder_init_class(const FunctionCallbackInfo<Value> &info) {
 	NX_DEF_GET(proto, "duration", nx_vd_get_duration);
 	NX_DEF_GET(proto, "fps", nx_vd_get_fps);
 	NX_DEF_GET(proto, "error", nx_vd_get_error);
+	NX_DEF_GET(proto, "errorKind", nx_vd_get_error_kind);
 	NX_DEF_GET(proto, "ended", nx_vd_get_ended);
 	NX_DEF_GET(proto, "usedVideo", nx_vd_get_has_video);
 	NX_DEF_GET(proto, "usedAudio", nx_vd_get_has_audio);

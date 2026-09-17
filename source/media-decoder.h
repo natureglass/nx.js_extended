@@ -17,6 +17,7 @@
 //     buffer (pointer swap, zero copy) based on the media clock. The clock
 //     is slaved to the audio stream node's consumed-frame counter when an
 //     audio track is playing, and to the monotonic wall clock otherwise.
+#include <atomic> // nx_media_open's abort_flag
 #include <memory>
 #include <stddef.h>
 #include <stdint.h>
@@ -71,10 +72,56 @@ bool nx_media_decode_audio(const uint8_t *data, size_t size,
 // Mesa-nouveau GL (see the Jellyfin video-perf work). Default false keeps the
 // documented BGRA contract for the Three.js webgl_materials_video demo and the
 // legacy `<video>` element (video.cc).
+// Per-open HTTP request shaping for network sources (2026-09-17). Both
+// fields are borrowed for the duration of the nx_media_open call only —
+// libavformat copies them into its own AVDictionary — so the caller may
+// point them at temporaries.
+//
+// Why this exists: a large slice of public HLS (the iptv-org catalogue in
+// particular) rejects libavformat's default `Lavf/<version>` User-Agent with
+// 403/connection-reset, and a smaller slice gates on Referer. Measured over
+// 70 such streams: 27/70 played with the stock UA, 44/70 with a browser UA.
+// Referer additionally unlocks streams that a real browser CANNOT reach at
+// all, because `Referer` is a forbidden header name in the Fetch spec.
+//
+// Only `user_agent` and `referer` are exposed — NOT a raw header blob. Both
+// map to dedicated libavformat AVOptions, so we never concatenate into the
+// request head ourselves, and both are stripped of CR/LF before use (their
+// values routinely originate in remotely-fetched playlists).
+struct nx_media_net_t {
+	// Override the User-Agent. NULL/empty = the engine's browser-like
+	// default (NOT libavformat's `Lavf/...`, which is what gets blocked).
+	const char *user_agent;
+	// Referer to send. NULL/empty = send none.
+	const char *referer;
+};
+
+// `av_err` (2026-09-17, optional): on failure receives the raw AVERROR that
+// caused the open to fail, so callers can tell a hard rejection (403/404 —
+// retrying is pointless) from a transient one (timeout, connection reset —
+// worth another attempt) without pattern-matching the human-readable string
+// in `errbuf`. Untouched on success. See nx_media_fail_kind().
+// `abort_flag` (2026-09-17, optional): caller-owned latch polled by
+// libavformat during every blocking IO operation. Set it to make an
+// in-flight open or read bail out promptly (AVERROR_EXIT -> fail kind
+// "aborted") instead of blocking to the 30s rw_timeout. REQUIRED for any
+// caller that can tear a decoder down while its open is still in flight,
+// because teardown joins the open thread: without this, closing a decoder
+// aimed at a dead host freezes the calling thread for the whole timeout.
+// Must outlive the returned media.
 nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
                           size_t mem_size, std::shared_ptr<void> keepalive,
                           char *errbuf, size_t errbuf_size,
-                          bool want_yuv = false);
+                          bool want_yuv = false,
+                          const nx_media_net_t *net = nullptr,
+                          int *av_err = nullptr,
+                          std::atomic<bool> *abort_flag = nullptr);
+
+// Map an AVERROR from nx_media_open's `av_err` to a short stable token for
+// JS: "forbidden", "not-found", "unauthorized", "server-error", "timeout",
+// "network", "format", "not-found-local", or "unknown". Stable across
+// releases — apps branch on these, so treat them as API.
+const char *nx_media_fail_kind(int av_err);
 
 // Metadata (valid after a successful open).
 int nx_media_width(nx_media_t *m);

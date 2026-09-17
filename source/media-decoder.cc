@@ -17,6 +17,7 @@ extern "C" {
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <errno.h> // AVERROR(ETIMEDOUT) etc in nx_media_fail_kind
 #include <math.h>
 #include <mutex>
 #include <stdio.h>
@@ -79,6 +80,19 @@ struct video_slot {
 } // namespace
 
 struct nx_media {
+	// Caller-owned abort latch (2026-09-17). Polled by libavformat through
+	// `interrupt_callback` during EVERY blocking IO operation — the open,
+	// the HLS playlist/segment fetches, and av_read_frame during playback.
+	// Setting it makes the in-flight call return AVERROR_EXIT promptly
+	// instead of running to the 30s rw_timeout.
+	//
+	// This is what makes a decoder cancellable. Without it, tearing down a
+	// decoder whose open is blocked on a dead host froze the V8 main thread
+	// for the whole rw_timeout, because close()/the finalizer JOIN the open
+	// thread. Owned by the caller (the decoder outlives the media), so it
+	// stays valid for the whole media lifetime.
+	std::atomic<bool> *abort_flag = nullptr;
+
 	// ---- IO (file or memory) ----
 	FILE *file = nullptr;
 	int64_t file_size = 0;
@@ -872,12 +886,91 @@ static bool nx_is_network_url(const char *path) {
 	       strncmp(path, "https://", 8) == 0;
 }
 
+// Default User-Agent for network media (2026-09-17).
+//
+// libavformat otherwise sends `Lavf/<version>`, which a large slice of public
+// HLS rejects outright — the origin either 403s or drops the connection. This
+// is not a theoretical concern: measured over 70 iptv-org streams that carry
+// an `#EXTVLCOPT:http-user-agent` line, the stock UA played 27 and a plain
+// browser UA played 44, with zero regressions across a separate 80-stream
+// sample that carries no such line (60 -> 63).
+//
+// Deliberately a plain desktop-Chrome string with NO `Brewser/1.0` token.
+// The engine-detection token belongs on the *page* User-Agent (see the
+// runtime's UA plumbing); appending an unrecognised token here is exactly
+// what draws the 403s this constant exists to avoid. Keep the two separate.
+#define NX_MEDIA_DEFAULT_USER_AGENT                                            \
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, "    \
+	"like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+// Copy `src` into `dst` with CR and LF removed, NUL-terminated.
+//
+// `user_agent` and `referer` are written into the request head by
+// libavformat's http protocol, so a raw CR/LF in either would terminate the
+// header line early and let the remainder be read as additional headers. The
+// values reach us from remotely-fetched M3U playlists, i.e. attacker-shaped
+// content, so they are sanitised at the boundary rather than trusted.
+// Returns false when `src` is null/empty (nothing to set).
+static bool nx_sanitize_header_value(const char *src, char *dst,
+                                     size_t dst_size) {
+	if (!src || !dst || dst_size == 0) return false;
+	size_t w = 0;
+	for (size_t r = 0; src[r] && w + 1 < dst_size; r++) {
+		const char c = src[r];
+		if (c == '\r' || c == '\n') continue;
+		dst[w++] = c;
+	}
+	dst[w] = '\0';
+	return w > 0;
+}
+
+// libavformat interrupt hook. Returning non-zero makes the blocking call in
+// progress bail out with AVERROR_EXIT. Called very frequently from inside
+// IO, so it must stay trivial — one relaxed atomic load.
+static int nx_media_interrupt_cb(void *opaque) {
+	nx_media *m = static_cast<nx_media *>(opaque);
+	if (!m || !m->abort_flag) return 0;
+	return m->abort_flag->load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+// Stable JS-facing classification of an open failure. The point is to let a
+// caller distinguish "this stream is gone, stop offering it" from "the
+// network hiccuped, try again later" — a distinction that matters a lot for
+// catalogue apps, which otherwise blacklist a working channel on one blip.
+const char *nx_media_fail_kind(int av_err) {
+	if (av_err == 0) return "unknown";
+	switch (av_err) {
+	case AVERROR_HTTP_FORBIDDEN:     return "forbidden";     // 403 — geo/hdr
+	case AVERROR_HTTP_NOT_FOUND:     return "not-found";     // 404 — gone
+	case AVERROR_HTTP_UNAUTHORIZED:  return "unauthorized";  // 401
+	case AVERROR_HTTP_SERVER_ERROR:  return "server-error";  // 5xx — transient
+	case AVERROR_HTTP_BAD_REQUEST:   return "bad-request";   // 400
+	case AVERROR_HTTP_OTHER_4XX:     return "client-error";
+	case AVERROR_INVALIDDATA:        return "format";
+	case AVERROR_PROTOCOL_NOT_FOUND: return "format";
+	case AVERROR_EXIT:               return "aborted"; // cancelled by us
+	default: break;
+	}
+	// Not compile-time constants on every platform, so tested separately.
+	if (av_err == AVERROR(ETIMEDOUT)) return "timeout";
+	if (av_err == AVERROR(ENOENT))    return "not-found-local";
+	if (av_err == AVERROR(ECONNREFUSED) || av_err == AVERROR(ECONNRESET) ||
+	    av_err == AVERROR(EHOSTUNREACH) || av_err == AVERROR(ENETUNREACH) ||
+	    av_err == AVERROR(EIO)) {
+		return "network";
+	}
+	return "unknown";
+}
+
 nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
                           size_t mem_size, std::shared_ptr<void> keepalive,
-                          char *errbuf, size_t errbuf_size, bool want_yuv) {
+                          char *errbuf, size_t errbuf_size, bool want_yuv,
+                          const nx_media_net_t *net, int *av_err,
+                          std::atomic<bool> *abort_flag) {
 	nx_media *m = new nx_media();
 	m->mem_hold = std::move(keepalive);
 	m->out_yuv = want_yuv;
+	m->abort_flag = abort_flag;
 	int ret = 0;
 	const AVCodec *vcodec = NULL;
 	const AVCodec *acodec = NULL;
@@ -896,6 +989,12 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 			snprintf(errbuf, errbuf_size, "out of memory");
 			goto fail;
 		}
+		// Install the abort hook BEFORE the open, so a cancel that arrives
+		// while we are still connecting is honoured. rw_timeout below is the
+		// backstop for a server that accepts and then stalls; this is the
+		// path that makes a user-initiated cancel instant.
+		m->fmt->interrupt_callback.callback = nx_media_interrupt_cb;
+		m->fmt->interrupt_callback.opaque = m;
 		// Bound blocking network reads/writes. The open now runs on a worker
 		// thread (video-decoder.cc), and a close() may join it — without a
 		// timeout a hung/slow server could block the join (and any read
@@ -922,12 +1021,63 @@ nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
 		// The whitelist at least keeps a redirect on http/https.
 		av_dict_set(&net_opts, "protocol_whitelist",
 		            "http,https,tcp,tls,crypto,hls,dash", 0);
+
+		// ---- request shaping (2026-09-17) -------------------------------
+		// `user_agent` and `referer` are dedicated http-protocol AVOptions,
+		// so libavformat composes the header lines itself — we never build a
+		// raw header blob, which keeps the injection surface to the value
+		// sanitiser below rather than to string concatenation.
+		//
+		// These two options MATTER BEYOND THE MANIFEST: libavformat's HLS
+		// demuxer harvests a fixed set of options off the parent AVIOContext
+		// (ffio_copy_url_options: headers, user_agent, cookies, http_proxy,
+		// referer, rw_timeout, icy) and replays them on every segment and
+		// key fetch. So a UA/Referer set here follows the whole rolling
+		// stream, not just the playlist request. That list is also why the
+		// reconnect options below cannot carry the load — see their comment.
+		char hdr_buf[1024];
+		if (net && nx_sanitize_header_value(net->user_agent, hdr_buf,
+		                                    sizeof(hdr_buf))) {
+			av_dict_set(&net_opts, "user_agent", hdr_buf, 0);
+		} else {
+			av_dict_set(&net_opts, "user_agent",
+			            NX_MEDIA_DEFAULT_USER_AGENT, 0);
+		}
+		if (net && nx_sanitize_header_value(net->referer, hdr_buf,
+		                                    sizeof(hdr_buf))) {
+			av_dict_set(&net_opts, "referer", hdr_buf, 0);
+		}
+
+		// ---- live-stream resilience -------------------------------------
+		// `seg_max_retry` is the one that counts for HLS. It defaults to 0,
+		// meaning a SINGLE failed segment fetch — a blip on a live edge that
+		// would recover on the next attempt — tears the whole decode down.
+		// Two retries costs nothing on a healthy stream.
+		//
+		// NOTE the asymmetry with the http `reconnect*` options set after
+		// it: those are NOT in ffio_copy_url_options' list, so they apply
+		// only to this top-level connection and never reach HLS segment
+		// fetches. They are still worth setting — they cover direct http
+		// media (mp4/ts/mp3) and the playlist connection itself — but they
+		// are NOT a substitute for seg_max_retry, and removing seg_max_retry
+		// on the assumption that "reconnect covers it" would silently undo
+		// this. `max_reload` covers playlist refreshes that come back short.
+		av_dict_set(&net_opts, "seg_max_retry", "2", 0);
+		av_dict_set(&net_opts, "max_reload", "5", 0);
+		av_dict_set(&net_opts, "reconnect", "1", 0);
+		av_dict_set(&net_opts, "reconnect_streamed", "1", 0);
+		av_dict_set(&net_opts, "reconnect_on_network_error", "1", 0);
+		// Bounded so a dead host still fails inside the rw_timeout budget
+		// rather than retrying until the join blocks.
+		av_dict_set(&net_opts, "reconnect_delay_max", "4", 0);
+
 		ret = avformat_open_input(&m->fmt, path, NULL, &net_opts);
 		av_dict_free(&net_opts);
 		if (ret < 0) {
 			// Surface the real AVERROR (DNS / TLS handshake / HTTP 4xx /
 			// "Protocol not found") — network opens fail many distinct ways.
 			av_strerror(ret, errbuf, errbuf_size);
+			if (av_err) *av_err = ret;
 			goto fail;
 		}
 	} else {

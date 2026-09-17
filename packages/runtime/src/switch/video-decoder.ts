@@ -41,6 +41,16 @@ export interface VideoDecoderOptions {
 	 * — the dominant per-frame cost on the Switch's Mesa-nouveau GL. When set,
 	 * `nextFrame()`'s result has `yuv: true` + `colorSpace`. Default: false. */
 	yuv?: boolean;
+	/** 2026-09-17 — override the `User-Agent` sent for `http(s)://` sources.
+	 * Omit to use the engine's browser-like default, which is what most
+	 * public HLS expects; libavformat's own `Lavf/...` default is widely
+	 * rejected. Ignored for local media. CR/LF are stripped. */
+	userAgent?: string;
+	/** 2026-09-17 — `Referer` to send for `http(s)://` sources. Omit to send
+	 * none. Some origins gate playback on it, and unlike a browser (where
+	 * `Referer` is a forbidden header name) the decoder can set it freely.
+	 * Ignored for local media. CR/LF are stripped. */
+	referer?: string;
 }
 
 export interface VideoFrameData {
@@ -124,6 +134,13 @@ export class VideoDecoder {
 	declare readonly audioError: string | null;
 	/** First decoder error encountered, or `null`. */
 	declare readonly error: string | null;
+	/** Short stable classification of an OPEN failure, or `null` while
+	 * opening and once the open has succeeded. One of `forbidden`,
+	 * `not-found`, `unauthorized`, `server-error`, `bad-request`,
+	 * `client-error`, `format`, `timeout`, `network`, `not-found-local`,
+	 * `unknown`. Distinguishes a permanent rejection from a transient one
+	 * without parsing `error`. */
+	declare readonly errorKind: string | null;
 	/** Slice 2b followup #5: true when audio is silenced. Driven by
 	 * {@link setMuted}; setting this calls `audrvVoiceSetVolume(0|1)`
 	 * on the audio voice. Persists across pause/resume + seeks. */
